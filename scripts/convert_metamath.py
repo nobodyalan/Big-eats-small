@@ -2,9 +2,9 @@
 """
 MetaMathQA_GSM8K_zh → 桥训练格式转换
 
-输入: metamath_gsm8k_zh.json(365MB, 231,685 条)
+输入: data/metamath_gsm8k_zh.json(365MB, 231,685 条)
       字段: query_zh(中文题) / response_zh(中文分步思路, 以 "#### 答案" 结尾) / type
-输出: train_metamath.jsonl, 每行 {"text": "题目\\n解题思路:思路"}
+输出: data/train_metamath.jsonl, 每行 {"text": "题目\\n解题思路:思路"}
       —— 与 bridge_train.py 的 split_sender_target 切分约定一致
       (发送者只见题目, 接收者生成思路)
 
@@ -25,8 +25,8 @@ except Exception:
 
 def main():
     parser = argparse.ArgumentParser(description="MetaMathQA_GSM8K_zh → 训练 jsonl")
-    parser.add_argument("--src", default="metamath_gsm8k_zh.json")
-    parser.add_argument("--out", default="train_metamath.jsonl")
+    parser.add_argument("--src", default="data/metamath_gsm8k_zh.json")
+    parser.add_argument("--out", default="data/train_metamath.jsonl")
     parser.add_argument("--limit", type=int, default=0, help="最多转换条数(0=全部)")
     parser.add_argument("--type", default="", help="只保留指定 type(如 GSM_AnsAug),空=全部")
     args = parser.parse_args()

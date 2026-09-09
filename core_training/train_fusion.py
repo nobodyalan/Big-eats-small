@@ -8,8 +8,9 @@
 训练目标: 因果语言建模(下一 token 预测)损失。
 梯度路径: loss → 4B 第 24 层注入点 → adapter2 → 0.6B 中段层 → adapter1。
 
-针对 12GB 显存(RTX 4080 Laptop)的默认设置:
-  bf16 权重 + 梯度检查点 + batch=1 + 最大序列 256。
+针对 H100 等大显存 GPU 的默认设置:
+  bf16 权重 + 关闭梯度检查点(更快) + batch=8 + 最大序列 512 + 3 epoch。
+小显存(如 12GB)请改用: --grad_checkpoint 1 --batch_size 1 --max_len 256。
 (注意: 梯度检查点要求模型处于 .train() 状态才会生效; Qwen3 的
  attention_dropout=0.0, 所以 train 模式不会引入 dropout 噪声。)
 
@@ -30,6 +31,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# 项目根目录 = 上一级(BES); 把 core_training/(main) 与 eval/(main 的依赖) 加入导入路径
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_ROOT, "core_training"))
+sys.path.insert(0, os.path.join(_ROOT, "eval"))
 
 from main import (Config, attach_fusion, save_fusion, load_fusion,
                   model_device, resolve_dtype, resolve_model_path)
@@ -175,20 +181,20 @@ def plot_losses(train_ce_history, eval_history, path):
 # ╚══════════════════════════════════════════════════════════════════════════╝
 def main():
     parser = argparse.ArgumentParser(description="训练门控残差融合适配器")
-    parser.add_argument("--data", default="train_metamath.jsonl")
+    parser.add_argument("--data", default="data/train_metamath.jsonl")
     parser.add_argument("--max_samples", type=int, default=0, help="最多训练条数(0=全部)")
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--max_len", type=int, default=256, help="单条最大 token 数(显存不足先调小)")
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--max_len", type=int, default=512, help="单条最大 token 数(显存不足先调小)")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--gate_init", type=float, default=0.0,
                         help="训练起始 gate_logit(0→sigmoid=0.5);-10 会以 4.5e-5 阻塞梯度")
-    parser.add_argument("--grad_checkpoint", type=int, default=1, help="1=梯度检查点(省显存)")
-    parser.add_argument("--batch_size", type=int, default=1, help="训练 batch(12GB 建议 1)")
+    parser.add_argument("--grad_checkpoint", type=int, default=0, help="1=梯度检查点(省显存但更慢)")
+    parser.add_argument("--batch_size", type=int, default=8, help="训练 batch(H100 可用 8~16)")
     parser.add_argument("--contrast_weight", type=float, default=0.0,
                         help="InterLat 式 JS 对比损失权重(0=关闭;>0 时防止模型无视旁路)")
     parser.add_argument("--eval_every", type=int, default=50, help="每隔 N 步对比一次 baseline/fusion loss")
-    parser.add_argument("--eval_samples", type=int, default=16, help="从数据里留出多少条作评估集")
+    parser.add_argument("--eval_samples", type=int, default=64, help="从数据里留出多少条作评估集")
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--out", default="cache/fusion_adapter.pt")
     parser.add_argument("--resume", default="", help="从已保存的旁路参数继续")

@@ -25,6 +25,10 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+# 项目根目录 = 上一级(BES); main 在 core_training/ 下, 需把 eval/ 加入导入路径
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_ROOT, "eval"))
+
 from eval_questions import EVAL_QUESTIONS  # 推理能力测试题集(评测模式使用)
 
 # Windows 控制台默认 GBK 编码,打印中文可能报 UnicodeEncodeError,统一转为 UTF-8 输出
@@ -54,7 +58,7 @@ class Config:
                                       #   → adapter2(1024→2560) → ×gate → 加回 2/3 处残差流
     fusion_pos1_frac: float = 1 / 3   # 4B 取隐状态的位置(36 层 → 第 12 层输出)
     fusion_pos2_frac: float = 2 / 3   # 4B 加回残差的位置(第 24 层输出)
-    fusion_mlp_dim: int = 2048        # 适配器 MLP 维度(可调)
+    fusion_mlp_dim: int = 4096        # 适配器 MLP 中间层维度(可调; 4096 → 约 44M 旁路参数)
 
     # ── 最终解码 ──────────────────────────────────────────────────────────
     max_new_tokens: int = 512

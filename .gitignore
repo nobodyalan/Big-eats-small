@@ -9,10 +9,10 @@ venv/
 cache/
 
 # ── 大数据集 / 训练数据(超过 GitHub 100MB 限制, 不入库) ──
-metamath_gsm8k_zh.json
-train_metamath.jsonl
-calib.jsonl
-calib_src/
+data/
+
+# ── 评测输出 ────────────────────────────────────────────
+eval_results/
 
 # ── 本地工具 / 编辑器 ───────────────────────────────────
 .claude/

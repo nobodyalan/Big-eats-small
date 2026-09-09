@@ -7,11 +7,15 @@
 用法: python test_fusion.py
 """
 
+import os
 import sys
 import torch
 
 sys.stdout.reconfigure(encoding="utf-8")
-sys.path.insert(0, r"C:\Users\HP\Desktop\modelBridge\BES")
+# 项目根目录 = 上一级(BES); 把 core_training/(main) 与 eval/ 加入导入路径
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_ROOT, "core_training"))
+sys.path.insert(0, os.path.join(_ROOT, "eval"))
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 

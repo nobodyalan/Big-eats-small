@@ -22,6 +22,11 @@ import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+# 项目根目录 = 上一级(BES); 把 core_training/(main) 与 eval/(eval_questions) 加入导入路径
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_ROOT, "core_training"))
+sys.path.insert(0, os.path.join(_ROOT, "eval"))
+
 from eval_questions import EVAL_QUESTIONS
 from main import Config, build_prompt_text, resolve_dtype, resolve_model_path
 
