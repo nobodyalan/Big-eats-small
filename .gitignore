@@ -1,0 +1,27 @@
+# ── Python ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ── 模型权重 / 训练产物(cache 里的 .pt 很大, 不入库) ──
+cache/
+
+# ── 大数据集 / 训练数据(超过 GitHub 100MB 限制, 不入库) ──
+metamath_gsm8k_zh.json
+train_metamath.jsonl
+calib.jsonl
+calib_src/
+
+# ── 本地工具 / 编辑器 ───────────────────────────────────
+.claude/
+.vscode/
+.idea/
+
+# ── Jupyter ─────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── 系统 ────────────────────────────────────────────────
+Thumbs.db
+.DS_Store
