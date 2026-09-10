@@ -160,7 +160,9 @@ def collate(batch, tokenizer, max_len: int, answer_weight: float = 1.0):
 def causal_lm_loss(logits, labels, weights=None):
     """因果 LM: 每个位置预测下一个 token; padding/prompt 位置忽略(IGNORE)。
     weights 非空时对每个有效位置按权重加权(答案段加权用)。"""
-    shift_logits = logits[:, :-1, :].contiguous().float()   # 转 fp32 算 CE 更稳
+    # 保持 bf16 传给 F.cross_entropy(内部按 fp32 算 log_softmax), 省掉整张 fp32 logits 拷贝
+    # (batch×seq×151936 词表的 fp32 拷贝 ≈5GB, 是 4B 训练 OOM 的直接触发点)
+    shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = labels[:, 1:].contiguous()
     if weights is None:
         return F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)),
@@ -185,12 +187,13 @@ def js_contrastive(logits_n, logits_r, labels, margin=JS_MARGIN):
     逼模型去读旁路注入的隐状态。
     """
     # 与 CE 同对齐: logits[:, :-1] 预测 labels[:, 1:]
-    shift_n = logits_n[:, :-1, :].contiguous().float()
-    shift_r = logits_r[:, :-1, :].contiguous().float()
+    shift_n = logits_n[:, :-1, :].contiguous()
+    shift_r = logits_r[:, :-1, :].contiguous()
     shift_lab = labels[:, 1:].contiguous()
     valid = shift_lab != IGNORE
-    p = F.softmax(shift_n[valid], dim=-1).clamp_min(EPS)
-    q = F.softmax(shift_r[valid], dim=-1).clamp_min(EPS)
+    # 只对有效 token(远小于 batch×seq)转 fp32 做 softmax, 避免整张 fp32 拷贝
+    p = F.softmax(shift_n[valid].float(), dim=-1).clamp_min(EPS)
+    q = F.softmax(shift_r[valid].float(), dim=-1).clamp_min(EPS)
     m = 0.5 * (p + q)
     js_nats = 0.5 * F.kl_div(p.log(), m, reduction="batchmean") \
               + 0.5 * F.kl_div(q.log(), m, reduction="batchmean")
@@ -277,6 +280,8 @@ def main():
                         help="早停耐心: 连续 N 次评估 fusion loss 无改善就停(0=关闭)")
     parser.add_argument("--plot", default=None,
                         help="loss 图路径(默认=自动带层范围+时间戳; 传空字符串=不画)")
+    parser.add_argument("--attn_impl", default="",
+                        help="注意力实现(sdpa/flash_attention_2/eager; 空=自动)。旁路训练建议保持 sdpa")
     args = parser.parse_args()
 
     cfg = Config()
@@ -297,8 +302,10 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # flash 只给大模型: 小模型的层是手写循环调用(传 4D 掩码), flash 不支持 4D 掩码
+    attn_kwargs = {"attn_implementation": args.attn_impl} if args.attn_impl else {}
     small = AutoModelForCausalLM.from_pretrained(small_path, dtype=dt).cuda()
-    large = AutoModelForCausalLM.from_pretrained(large_path, dtype=dt).cuda()
+    large = AutoModelForCausalLM.from_pretrained(large_path, dtype=dt, **attn_kwargs).cuda()
     # 双模型全冻结,只训旁路(22M)
     for m in (small, large):
         for p in m.parameters():

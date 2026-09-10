@@ -67,6 +67,8 @@ def main():
     parser.add_argument("--patience", type=int, default=0)
     parser.add_argument("--plot", default=None,
                         help="loss 图路径(默认=自动带 rank+时间戳; 传空字符串=不画)")
+    parser.add_argument("--attn_impl", default="",
+                        help="注意力实现(sdpa/flash_attention_2/eager; 空=自动)。显存不足且已装 flash-attn 时用 flash_attention_2")
     args = parser.parse_args()
 
     cfg = Config()
@@ -80,9 +82,10 @@ def main():
     print(f"LoRA 输出目录: {out_dir} | loss 图: {plot_path}")
 
     # ── 加载 4B + 挂 LoRA ──
+    attn_kwargs = {"attn_implementation": args.attn_impl} if args.attn_impl else {}
     large_path = resolve_model_path(cfg.model_large_id, cfg.model_large_local)
     tokenizer = AutoTokenizer.from_pretrained(large_path)
-    model = AutoModelForCausalLM.from_pretrained(large_path, dtype=dt).cuda()
+    model = AutoModelForCausalLM.from_pretrained(large_path, dtype=dt, **attn_kwargs).cuda()
 
     from peft import LoraConfig, get_peft_model
     targets = [t.strip() for t in args.lora_target.split(",") if t.strip()]
