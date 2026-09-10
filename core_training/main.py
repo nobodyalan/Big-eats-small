@@ -246,13 +246,14 @@ class GatedResidualFusion(nn.Module):
         sm = self.small_model_ref
         B, L, _ = x.shape
         pos_ids = torch.arange(L, device=self.small_dev).unsqueeze(0)
+        cache_position = torch.arange(L, device=self.small_dev)   # transformers 5.3 需要该参数
         pos_emb = sm.rotary_emb(x, pos_ids)                      # 真实 rotary: cos/sin (B, L, D)
         # 与官方 Qwen3Model.forward 一致: create_causal_mask 返回的是「单个掩码」(张量或 None),
         # 不是字典。需要自己按层类型组装映射表;None 直接传给层的 attention_mask 即可
         # (层内部会自行构建因果掩码)。
         mask_kwargs = dict(config=sm.config, inputs_embeds=x,
-                           attention_mask=None, past_key_values=None,
-                           position_ids=pos_ids)
+                           attention_mask=None, cache_position=cache_position,
+                           past_key_values=None, position_ids=pos_ids)
         mask_map = {"full_attention": create_causal_mask(**mask_kwargs)}
         if getattr(sm, "has_sliding_layers", False):
             mask_map["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
