@@ -43,6 +43,10 @@ META_RAW = "data/.cache/math/MetaMathQA-395K.json"   # MetaMathQA 原始 json(~3
 META_MATH_JSONL = "data/metamath_math.jsonl"         # 英文 MATH 池
 META_GSM8K_JSONL = "data/metamath_gsm8k.jsonl"       # 英文 GSM8K 池
 
+# 统一指令(与 eval/eval_math.py 的 math_prompt 一致), 训练时 prompt 套 chat 模板
+INSTRUCTION = ("Solve the following math problem step by step, "
+               "and put your final answer in \\boxed{...}:\n\n")
+
 
 def download_file(url: str, dest: str) -> str:
     """urllib 下载(带进度); 失败时回退 requests"""
@@ -108,7 +112,7 @@ def convert_zh(src: str, out: str, force: bool):
             a = (r.get("response_zh") or "").strip()
             if not q or not a:
                 continue
-            f.write(json.dumps({"prompt": f"{q}\n解题思路:", "response": a},
+            f.write(json.dumps({"prompt": INSTRUCTION + q, "response": a},
                                ensure_ascii=False) + "\n")
             written += 1
     print(f"  中文写出 {written} 条")
@@ -130,7 +134,7 @@ def convert_metamath(src: str, math_out: str, gsm8k_out: str, force: bool):
             a = (r.get("response") or "").strip()
             if not q or not a:
                 continue
-            line = json.dumps({"prompt": f"{q}\n解题思路:", "response": a},
+            line = json.dumps({"prompt": INSTRUCTION + q, "response": a},
                               ensure_ascii=False) + "\n"
             if t.startswith("MATH"):
                 fm.write(line)

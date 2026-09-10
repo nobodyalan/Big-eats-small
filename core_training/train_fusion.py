@@ -100,8 +100,15 @@ def collate(batch, tokenizer, max_len: int, answer_weight: float = 1.0):
     for rec in batch:
         prompt = rec.get("prompt", "")
         resp = rec.get("response", "")
+        # 与评测一致: prompt 套 chat 模板(add_generation_prompt=True), response 直接拼在后面
+        if getattr(tokenizer, "chat_template", None):
+            p_text = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=False, add_generation_prompt=True)
+        else:
+            p_text = prompt
         # prompt 编码(给答案至少留 1 个位置)
-        p_ids = tokenizer(prompt, add_special_tokens=False).input_ids
+        p_ids = tokenizer(p_text, add_special_tokens=False).input_ids
         p_ids = p_ids[:max_len - 1]
         # response 编码 + 字符偏移(用于定位答案段)
         enc = tokenizer(resp, add_special_tokens=False, return_offsets_mapping=True)
