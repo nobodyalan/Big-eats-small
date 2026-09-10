@@ -13,8 +13,8 @@
 已存在的文件默认跳过(幂等), 用 --force 强制重新下载/转换。
 
 用法(在 BES 目录下执行):
-  python scripts/prepare_data.py                       # 全量: 中文20k + 英文7k 训练, 各500验证
-  python scripts/prepare_data.py --zh_train 500 --en_train 500 --zh_val 50 --en_val 50  # 试跑混合
+  python scripts/prepare_data.py                       # 全量: 中文20k + 英文6k 训练, 验证集=20%(中4k+英1.2k)
+  python scripts/prepare_data.py --zh_train 500 --en_train 500 --zh_val 100 --en_val 100  # 试跑混合
   python scripts/prepare_data.py --skip_mix            # 只下载+转换, 不混合
 """
 
@@ -160,9 +160,9 @@ def main():
                         help="中文数据集地址(逗号分隔多个备选)")
     parser.add_argument("--en_url", default=EN_URL, help="英文 MATH.zip 地址")
     parser.add_argument("--zh_train", type=int, default=20000, help="中文训练条数")
-    parser.add_argument("--en_train", type=int, default=7000, help="英文训练条数")
-    parser.add_argument("--zh_val", type=int, default=500, help="中文验证条数")
-    parser.add_argument("--en_val", type=int, default=500, help="英文验证条数")
+    parser.add_argument("--en_train", type=int, default=6000, help="英文训练条数(英文池仅 7500)")
+    parser.add_argument("--zh_val", type=int, default=4000, help="中文验证条数(默认=训练集的 20%)")
+    parser.add_argument("--en_val", type=int, default=1200, help="英文验证条数(默认=训练集的 20%)")
     parser.add_argument("--out_train", default="data/mix_train.jsonl")
     parser.add_argument("--out_val", default="data/mix_val.jsonl")
     parser.add_argument("--out_combined", default="data/mix_all.jsonl",

@@ -18,8 +18,8 @@
   # 小规模试跑: 中英各抽少量
   python scripts/mix_data.py --zh_train 1000 --en_train 500 --zh_val 100 --en_val 100
 
-  # 正式: 中文 2 万 + 英文 7.5k 全量训练, 各留 500 验证
-  python scripts/mix_data.py --zh_train 20000 --en_train 7500 --zh_val 500 --en_val 500 \
+  # 正式: 中文 2 万 + 英文 6k 训练, 验证集=训练集 20%(中 4k + 英 1.2k)
+  python scripts/mix_data.py --zh_train 20000 --en_train 6000 --zh_val 4000 --en_val 1200 \
                              --out_train data/mix_train.jsonl --out_val data/mix_val.jsonl \
                              --out_combined data/mix_all.jsonl
 """
@@ -62,9 +62,9 @@ def main():
     parser.add_argument("--zh", default="data/train_metamath.jsonl", help="中文 jsonl")
     parser.add_argument("--en", default="data/math_train.jsonl", help="英文 jsonl")
     parser.add_argument("--zh_train", type=int, default=20000, help="中文训练条数")
-    parser.add_argument("--en_train", type=int, default=7000, help="英文训练条数(英文池仅 7500, 需留出验证)")
-    parser.add_argument("--zh_val", type=int, default=500, help="中文验证条数")
-    parser.add_argument("--en_val", type=int, default=500, help="英文验证条数")
+    parser.add_argument("--en_train", type=int, default=6000, help="英文训练条数(英文池仅 7500, 需留出验证)")
+    parser.add_argument("--zh_val", type=int, default=4000, help="中文验证条数(默认=训练集的 20%)")
+    parser.add_argument("--en_val", type=int, default=1200, help="英文验证条数(默认=训练集的 20%)")
     parser.add_argument("--out_train", default="data/mix_train.jsonl")
     parser.add_argument("--out_val", default="data/mix_val.jsonl")
     parser.add_argument("--out_combined", default="",
