@@ -22,6 +22,7 @@
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -85,11 +86,12 @@ def collate(batch, tokenizer, max_len: int):
     pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos
     ids_list = []
     for t in batch:
-        ids = tokenizer(t, truncation=True, max_length=max_len,
+        # 预留 1 个位置给 EOS: 先截断到 max_len-1, 再补 EOS, 保证 EOS 不会被再砍掉
+        ids = tokenizer(t, truncation=True, max_length=max(1, max_len - 1),
                         return_tensors="pt").input_ids[0]
         if ids[-1].item() != eos:
             ids = torch.cat([ids, torch.tensor([eos])])
-        ids_list.append(ids[:max_len])
+        ids_list.append(ids)
     L = max(x.size(0) for x in ids_list)
     B = len(ids_list)
     input_ids = torch.full((B, L), pad, dtype=torch.long)
@@ -182,17 +184,19 @@ def plot_losses(train_ce_history, eval_history, path):
 def main():
     parser = argparse.ArgumentParser(description="训练门控残差融合适配器")
     parser.add_argument("--data", default="data/train_metamath.jsonl")
-    parser.add_argument("--max_samples", type=int, default=0, help="最多训练条数(0=全部)")
+    parser.add_argument("--max_samples", type=int, default=0, help="最多训练条数(0=全部; 评估集另算, 不被截断)")
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--max_len", type=int, default=512, help="单条最大 token 数(显存不足先调小)")
+    parser.add_argument("--max_len", type=int, default=1024, help="单条最大 token 数(显存不足先调小)")
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--warmup_steps", type=int, default=300,
+                        help="学习率线性 warmup 步数(0=关闭; 之后余弦衰减到 10%)")
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--gate_init", type=float, default=0.0,
                         help="训练起始 gate_logit(0→sigmoid=0.5);-10 会以 4.5e-5 阻塞梯度")
     parser.add_argument("--grad_checkpoint", type=int, default=0, help="1=梯度检查点(省显存但更慢)")
     parser.add_argument("--batch_size", type=int, default=8, help="训练 batch(H100 可用 8~16)")
-    parser.add_argument("--contrast_weight", type=float, default=0.0,
-                        help="InterLat 式 JS 对比损失权重(0=关闭;>0 时防止模型无视旁路)")
+    parser.add_argument("--contrast_weight", type=float, default=0.5,
+                        help="InterLat 式 JS 对比损失权重(0=关闭;>0 时防止旁路被无视/门控塌缩)")
     parser.add_argument("--eval_every", type=int, default=50, help="每隔 N 步对比一次 baseline/fusion loss")
     parser.add_argument("--eval_samples", type=int, default=64, help="从数据里留出多少条作评估集")
     parser.add_argument("--eval_batch_size", type=int, default=8, help="评估时的 batch(越大评估越快)")
@@ -267,13 +271,16 @@ def main():
     dev = model_device(large)
 
     # ── 数据: 切出评估集(不参与训练, 用来对比 baseline/fusion loss) ──
-    texts = load_texts(args.data, args.max_samples)
+    # 先全量加载, 从末尾切评估集, 再用 --max_samples 限制训练条数:
+    # 这样 --max_samples 做快速测试时, 评估集仍来自文件末尾的真实验证集, 不会混进训练
+    texts = load_texts(args.data, 0)
     if not texts:
         raise SystemExit(f"[错误] 无训练数据: {args.data}")
     # 按 --eval_samples 从末尾切出评估集; 不再强行 10% 上限, 只保证至少留 1 条训练样本
     n_eval = min(args.eval_samples, len(texts) - 1) if args.eval_samples > 0 else 0
     eval_texts = texts[-n_eval:] if n_eval else []
-    train_texts = texts[:-n_eval] if n_eval else texts
+    train_pool = texts[:-n_eval] if n_eval else texts
+    train_texts = train_pool[:args.max_samples] if args.max_samples > 0 else train_pool
     print(f"训练样本: {len(train_texts)} 条 | 评估样本: {len(eval_texts)} 条")
 
     coll = lambda b: collate(b, tokenizer, args.max_len)
@@ -281,6 +288,18 @@ def main():
                         shuffle=True, collate_fn=coll)
     eval_loader = DataLoader(TextDataset(eval_texts), batch_size=args.eval_batch_size,
                              shuffle=False, collate_fn=coll) if eval_texts else None
+
+    # 学习率调度: 线性 warmup → 余弦衰减到 10%×lr
+    scheduler = None
+    if args.warmup_steps > 0:
+        total_steps = len(loader) * args.epochs
+        def lr_lambda(step):
+            if step < args.warmup_steps:
+                return step / max(1, args.warmup_steps)
+            p = (step - args.warmup_steps) / max(1, total_steps - args.warmup_steps)
+            p = min(1.0, max(0.0, p))
+            return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * p))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
     def forward_logits(ids, mask):
         # bf16 前向 + fp32 主权重(autocast 自动把适配器的 fp32 权重在计算时降 bf16,
@@ -359,6 +378,8 @@ def main():
             total.backward()
             torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
             opt.step()
+            if scheduler is not None:
+                scheduler.step()
 
             step += 1
             train_ce_history.append((step, ce.item()))
@@ -367,7 +388,7 @@ def main():
                 gate = float(torch.sigmoid(fusion.gate_logit).detach())
                 extra = f" | js对比 {contrast.item():.4f}" if contrast is not None else ""
                 print(f"epoch {ep + 1} step {step:>6} | CE {ce.item():.4f}{extra} "
-                      f"| gate {gate:.5f} | {el:.0f}s")
+                      f"| gate {gate:.5f} | lr {opt.param_groups[0]['lr']:.2e} | {el:.0f}s")
 
             if eval_loader is not None and step % args.eval_every == 0:
                 f_loss, b_loss = evaluate()

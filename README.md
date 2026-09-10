@@ -72,11 +72,15 @@ python scripts/convert_metamath.py
 | 参数 | 默认 | 说明 |
 |------|------|------|
 | `--data` | `data/train_metamath.jsonl` | 训练数据 |
-| `--max_len` | 512 | 单条最大 token 数（显存不足调小） |
+| `--max_samples` | 0 | 最多训练条数（0=全部；评估集另算，不被截断） |
+| `--max_len` | 1024 | 单条最大 token 数（显存不足调小） |
 | `--lr` | 1e-4 | 学习率 |
 | `--batch_size` | 8 | batch（H100 建议 8~16；12GB 用 1） |
 | `--epochs` | 3 | 训练轮数 |
 | `--eval_every` | 50 | 每隔 N 步评估 fusion / baseline loss |
+| `--eval_samples` | 64 | 从数据末尾留出多少条作评估集 |
+| `--eval_batch_size` | 8 | 评估时的 batch（越大评估越快） |
+| `--eval_max_samples` | 400 | 每次评估最多用多少条（验证集大时设小，0=全部） |
 | `--patience` | 0 | 早停耐心（0=关闭） |
 | `--contrast_weight` | 0 | InterLat 式 JS 对比损失权重（防旁路塌缩，需 `--batch_size ≥ 2`） |
 
