@@ -130,7 +130,7 @@ def load_test_problems(zip_path: str, seed: int, limit: int):
     if limit > 0:
         names = names[:limit]
     probs = []
-    for name in sorted(names):
+    for name in names:      # 保持 shuffle 后的随机顺序(不要 sorted, 否则会按学科排序)
         with zf.open(name) as f:
             probs.append(json.load(f))
     return probs
@@ -247,6 +247,9 @@ def main():
             "baseline_extract_rate": round(b_extract / n_total, 4),
         })
         print(f"baseline 准确率: {summary['baseline_acc']:.2%} ({b_correct}/{n_total})")
+        n_diff = sum(1 for x in results if x.get("fusion_pred") != x.get("baseline_pred"))
+        print(f"最终答案与 baseline 不同的题数: {n_diff}/{n_total}")
+        summary["n_answer_changed"] = n_diff
         print(f"差值(fusion - baseline): {summary['fusion_acc'] - summary['baseline_acc']:+.2%}")
     print(f"总耗时: {time.time() - t0:.0f}s")
 

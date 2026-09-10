@@ -107,7 +107,8 @@ def convert_zh(src: str, out: str, force: bool):
             a = (r.get("response_zh") or "").strip()
             if not q or not a:
                 continue
-            f.write(json.dumps({"text": f"{q}\n解题思路:{a}"}, ensure_ascii=False) + "\n")
+            f.write(json.dumps({"prompt": f"{q}\n解题思路:", "response": a},
+                               ensure_ascii=False) + "\n")
             written += 1
     print(f"  中文写出 {written} 条")
 
@@ -130,7 +131,8 @@ def convert_en(zip_path: str, out: str, force: bool):
             a = (r.get("solution") or "").strip()
             if not q or not a:
                 continue
-            f.write(json.dumps({"text": f"{q}\n解题思路:{a}"}, ensure_ascii=False) + "\n")
+            f.write(json.dumps({"prompt": f"{q}\n解题思路:", "response": a},
+                               ensure_ascii=False) + "\n")
             written += 1
     print(f"  英文写出 {written} 条")
 

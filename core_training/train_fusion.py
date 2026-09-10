@@ -52,21 +52,32 @@ IGNORE = -100
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  ① 数据加载                                                            ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
-def load_texts(path: str, max_samples: int):
-    """读 jsonl(每行 {"text": "题目\\n解题思路:..."} 或纯文本行)"""
-    texts = []
+def load_records(path: str, max_samples: int):
+    """读 jsonl, 每行返回 {"prompt":..., "response":...}。
+    兼容旧格式 {"text": "题目\\n解题思路:答案"}(自动按 '解题思路:' 拆成 prompt/response)。"""
+    recs = []
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             try:
-                texts.append(json.loads(line).get("text", "") or line)
+                obj = json.loads(line)
             except json.JSONDecodeError:
-                texts.append(line)
-            if max_samples > 0 and len(texts) >= max_samples:
+                obj = {"text": line}
+            if "prompt" in obj:
+                recs.append({"prompt": obj.get("prompt", ""),
+                             "response": obj.get("response", "")})
+            else:
+                t = obj.get("text", "") or line
+                if "解题思路:" in t:
+                    p, r = t.split("解题思路:", 1)
+                    recs.append({"prompt": p + "解题思路:", "response": r})
+                else:
+                    recs.append({"prompt": t, "response": ""})
+            if max_samples > 0 and len(recs) >= max_samples:
                 break
-    return [t for t in texts if t.strip()]
+    return [r for r in recs if r["response"].strip() or r["prompt"].strip()]
 
 
 class TextDataset(Dataset):
@@ -80,36 +91,77 @@ class TextDataset(Dataset):
         return self.texts[i]
 
 
-def collate(batch, tokenizer, max_len: int):
-    """把一批文本编码成 input_ids / attention_mask / labels(因果 LM 用)"""
+def collate(batch, tokenizer, max_len: int, answer_weight: float = 1.0):
+    """SFT 式编码: 只对 response 算 loss(prompt 位置 label=IGNORE),
+    并给最终答案段(\\boxed / #### 之后)加权。返回 (input_ids, attention_mask, labels, weights)。"""
     eos = tokenizer.eos_token_id
     pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos
-    ids_list = []
-    for t in batch:
-        # 预留 1 个位置给 EOS: 先截断到 max_len-1, 再补 EOS, 保证 EOS 不会被再砍掉
-        ids = tokenizer(t, truncation=True, max_length=max(1, max_len - 1),
-                        return_tensors="pt").input_ids[0]
-        if ids[-1].item() != eos:
-            ids = torch.cat([ids, torch.tensor([eos])])
-        ids_list.append(ids)
+    ids_list, labels_list, weights_list = [], [], []
+    for rec in batch:
+        prompt = rec.get("prompt", "")
+        resp = rec.get("response", "")
+        # prompt 编码(给答案至少留 1 个位置)
+        p_ids = tokenizer(prompt, add_special_tokens=False).input_ids
+        p_ids = p_ids[:max_len - 1]
+        # response 编码 + 字符偏移(用于定位答案段)
+        enc = tokenizer(resp, add_special_tokens=False, return_offsets_mapping=True)
+        r_ids, r_off = enc.input_ids, enc.offset_mapping
+        r_ids = r_ids[:max_len - len(p_ids)]
+        r_off = r_off[:len(r_ids)]
+        if not r_ids or r_ids[-1] != eos:
+            r_ids = r_ids + [eos]
+            r_off = r_off + [(0, 0)]
+        r_ids = r_ids[:max_len - len(p_ids)]
+        r_off = r_off[:len(r_ids)]
+        # 定位答案段起点(最后一个 \boxed 或 ####), 之后加权
+        ans_char = -1
+        for marker in ("\\boxed", "####"):
+            i = resp.rfind(marker)
+            if i != -1:
+                ans_char = i
+                break
+        ans_tok = None
+        if ans_char != -1:
+            for k, (s, e) in enumerate(r_off):
+                if s <= ans_char < e:
+                    ans_tok = k
+                    break
+        w = [1.0] * len(r_ids)
+        if ans_tok is not None:
+            for k in range(ans_tok, len(r_ids)):
+                w[k] = answer_weight
+        ids_list.append(torch.tensor(p_ids + r_ids, dtype=torch.long))
+        labels_list.append(torch.tensor([IGNORE] * len(p_ids) + r_ids, dtype=torch.long))
+        weights_list.append(torch.tensor([0.0] * len(p_ids) + w, dtype=torch.float32))
     L = max(x.size(0) for x in ids_list)
     B = len(ids_list)
     input_ids = torch.full((B, L), pad, dtype=torch.long)
     attention_mask = torch.zeros((B, L), dtype=torch.long)
-    for i, x in enumerate(ids_list):
-        input_ids[i, :x.size(0)] = x
-        attention_mask[i, :x.size(0)] = 1
-    labels = input_ids.clone()
-    labels[attention_mask == 0] = IGNORE
-    return input_ids, attention_mask, labels
+    labels = torch.full((B, L), IGNORE, dtype=torch.long)
+    weights = torch.zeros((B, L), dtype=torch.float32)
+    for i in range(B):
+        n = ids_list[i].size(0)
+        input_ids[i, :n] = ids_list[i]
+        attention_mask[i, :n] = 1
+        labels[i, :n] = labels_list[i]
+        weights[i, :n] = weights_list[i]
+    return input_ids, attention_mask, labels, weights
 
 
-def causal_lm_loss(logits, labels):
-    """标准因果 LM: 每个位置预测下一个 token,padding 位置忽略"""
+def causal_lm_loss(logits, labels, weights=None):
+    """因果 LM: 每个位置预测下一个 token; padding/prompt 位置忽略(IGNORE)。
+    weights 非空时对每个有效位置按权重加权(答案段加权用)。"""
     shift_logits = logits[:, :-1, :].contiguous().float()   # 转 fp32 算 CE 更稳
     shift_labels = labels[:, 1:].contiguous()
-    return F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)),
-                           shift_labels.view(-1), ignore_index=IGNORE)
+    if weights is None:
+        return F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)),
+                               shift_labels.view(-1), ignore_index=IGNORE)
+    ce = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)),
+                         shift_labels.view(-1), ignore_index=IGNORE, reduction="none")
+    ce = ce.view(shift_labels.shape)
+    w = weights[:, 1:].to(ce.device).float()
+    mask = (shift_labels != IGNORE).float()
+    return (ce * w * mask).sum() / (w * mask).sum().clamp(min=1)
 
 
 JS_MARGIN = 0.69   # JS 散度上界 ln2≈0.69(InterLat 的铰链阈值)
@@ -183,7 +235,7 @@ def plot_losses(train_ce_history, eval_history, path):
 # ╚══════════════════════════════════════════════════════════════════════════╝
 def main():
     parser = argparse.ArgumentParser(description="训练门控残差融合适配器")
-    parser.add_argument("--data", default="data/train_metamath.jsonl")
+    parser.add_argument("--data", default="data/mix_all.jsonl")
     parser.add_argument("--max_samples", type=int, default=0, help="最多训练条数(0=全部; 评估集另算, 不被截断)")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--max_len", type=int, default=1024, help="单条最大 token 数(显存不足先调小)")
@@ -197,13 +249,15 @@ def main():
     parser.add_argument("--batch_size", type=int, default=8, help="训练 batch(H100 可用 8~16)")
     parser.add_argument("--contrast_weight", type=float, default=0.5,
                         help="InterLat 式 JS 对比损失权重(0=关闭;>0 时防止旁路被无视/门控塌缩)")
-    parser.add_argument("--eval_every", type=int, default=50, help="每隔 N 步对比一次 baseline/fusion loss")
+    parser.add_argument("--answer_weight", type=float, default=1.0,
+                        help="最终答案段(\\boxed/#### 之后)的 loss 权重(SFT 答案加权)")
+    parser.add_argument("--eval_every", type=int, default=200, help="每隔 N 步对比一次 baseline/fusion loss")
     parser.add_argument("--eval_samples", type=int, default=64, help="从数据里留出多少条作评估集")
     parser.add_argument("--eval_batch_size", type=int, default=8, help="评估时的 batch(越大评估越快)")
     parser.add_argument("--eval_max_samples", type=int, default=400,
                         help="每次评估最多用多少条(0=全部; 验证集大时应设小, 否则每步评估很慢)")
     parser.add_argument("--log_every", type=int, default=10)
-    parser.add_argument("--out", default="cache/fusion_adapter.pt")
+    parser.add_argument("--out", default="cache/fusion_adapter_sft.pt")
     parser.add_argument("--resume", default="", help="从已保存的旁路参数继续")
     parser.add_argument("--patience", type=int, default=0,
                         help="早停耐心: 连续 N 次评估 fusion loss 无改善就停(0=关闭)")
@@ -273,21 +327,21 @@ def main():
     # ── 数据: 切出评估集(不参与训练, 用来对比 baseline/fusion loss) ──
     # 先全量加载, 从末尾切评估集, 再用 --max_samples 限制训练条数:
     # 这样 --max_samples 做快速测试时, 评估集仍来自文件末尾的真实验证集, 不会混进训练
-    texts = load_texts(args.data, 0)
-    if not texts:
+    recs = load_records(args.data, 0)
+    if not recs:
         raise SystemExit(f"[错误] 无训练数据: {args.data}")
     # 按 --eval_samples 从末尾切出评估集; 不再强行 10% 上限, 只保证至少留 1 条训练样本
-    n_eval = min(args.eval_samples, len(texts) - 1) if args.eval_samples > 0 else 0
-    eval_texts = texts[-n_eval:] if n_eval else []
-    train_pool = texts[:-n_eval] if n_eval else texts
-    train_texts = train_pool[:args.max_samples] if args.max_samples > 0 else train_pool
-    print(f"训练样本: {len(train_texts)} 条 | 评估样本: {len(eval_texts)} 条")
+    n_eval = min(args.eval_samples, len(recs) - 1) if args.eval_samples > 0 else 0
+    eval_recs = recs[-n_eval:] if n_eval else []
+    train_pool = recs[:-n_eval] if n_eval else recs
+    train_recs = train_pool[:args.max_samples] if args.max_samples > 0 else train_pool
+    print(f"训练样本: {len(train_recs)} 条 | 评估样本: {len(eval_recs)} 条")
 
-    coll = lambda b: collate(b, tokenizer, args.max_len)
-    loader = DataLoader(TextDataset(train_texts), batch_size=args.batch_size,
+    coll = lambda b: collate(b, tokenizer, args.max_len, args.answer_weight)
+    loader = DataLoader(TextDataset(train_recs), batch_size=args.batch_size,
                         shuffle=True, collate_fn=coll)
-    eval_loader = DataLoader(TextDataset(eval_texts), batch_size=args.eval_batch_size,
-                             shuffle=False, collate_fn=coll) if eval_texts else None
+    eval_loader = DataLoader(TextDataset(eval_recs), batch_size=args.eval_batch_size,
+                             shuffle=False, collate_fn=coll) if eval_recs else None
 
     # 学习率调度: 线性 warmup → 余弦衰减到 10%×lr
     scheduler = None
@@ -316,7 +370,7 @@ def main():
         f_sum = b_sum = 0.0
         n = 0
         seen = 0
-        for ids, mask, labels in eval_loader:
+        for ids, mask, labels, _w in eval_loader:
             ids, mask, labels = ids.to(dev), mask.to(dev), labels.to(dev)
             fusion.enabled = True
             f_sum += causal_lm_loss(forward_logits(ids, mask), labels).item()
@@ -342,16 +396,17 @@ def main():
     t0 = time.time()
     step = 0
     for ep in range(args.epochs):
-        for ids, mask, labels in loader:
+        for ids, mask, labels, weights in loader:
             ids = ids.to(dev)
             mask = mask.to(dev)
             labels = labels.to(dev)
+            weights = weights.to(dev)
 
             opt.zero_grad()
             fusion.enabled = True
             large.train()                     # 确保梯度检查点生效
             logits = forward_logits(ids, mask)
-            ce = causal_lm_loss(logits, labels)
+            ce = causal_lm_loss(logits, labels, weights)
             total = ce
 
             contrast = None
