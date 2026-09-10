@@ -195,6 +195,9 @@ def main():
                         help="InterLat 式 JS 对比损失权重(0=关闭;>0 时防止模型无视旁路)")
     parser.add_argument("--eval_every", type=int, default=50, help="每隔 N 步对比一次 baseline/fusion loss")
     parser.add_argument("--eval_samples", type=int, default=64, help="从数据里留出多少条作评估集")
+    parser.add_argument("--eval_batch_size", type=int, default=8, help="评估时的 batch(越大评估越快)")
+    parser.add_argument("--eval_max_samples", type=int, default=400,
+                        help="每次评估最多用多少条(0=全部; 验证集大时应设小, 否则每步评估很慢)")
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--out", default="cache/fusion_adapter.pt")
     parser.add_argument("--resume", default="", help="从已保存的旁路参数继续")
@@ -267,7 +270,8 @@ def main():
     texts = load_texts(args.data, args.max_samples)
     if not texts:
         raise SystemExit(f"[错误] 无训练数据: {args.data}")
-    n_eval = min(args.eval_samples, max(1, len(texts) // 10)) if args.eval_samples > 0 else 0
+    # 按 --eval_samples 从末尾切出评估集; 不再强行 10% 上限, 只保证至少留 1 条训练样本
+    n_eval = min(args.eval_samples, len(texts) - 1) if args.eval_samples > 0 else 0
     eval_texts = texts[-n_eval:] if n_eval else []
     train_texts = texts[:-n_eval] if n_eval else texts
     print(f"训练样本: {len(train_texts)} 条 | 评估样本: {len(eval_texts)} 条")
@@ -275,7 +279,7 @@ def main():
     coll = lambda b: collate(b, tokenizer, args.max_len)
     loader = DataLoader(TextDataset(train_texts), batch_size=args.batch_size,
                         shuffle=True, collate_fn=coll)
-    eval_loader = DataLoader(TextDataset(eval_texts), batch_size=1,
+    eval_loader = DataLoader(TextDataset(eval_texts), batch_size=args.eval_batch_size,
                              shuffle=False, collate_fn=coll) if eval_texts else None
 
     def forward_logits(ids, mask):
@@ -292,6 +296,7 @@ def main():
         large.eval()          # 关梯度检查点(只在 train 模式生效),no_grad 下干净前向
         f_sum = b_sum = 0.0
         n = 0
+        seen = 0
         for ids, mask, labels in eval_loader:
             ids, mask, labels = ids.to(dev), mask.to(dev), labels.to(dev)
             fusion.enabled = True
@@ -300,6 +305,9 @@ def main():
             b_sum += causal_lm_loss(forward_logits(ids, mask), labels).item()
             fusion.enabled = True
             n += 1
+            seen += ids.size(0)
+            if args.eval_max_samples > 0 and seen >= args.eval_max_samples:
+                break
         large.train()         # 恢复训练模式(重新启用梯度检查点)
         return f_sum / n, b_sum / n
 
@@ -356,7 +364,7 @@ def main():
             train_ce_history.append((step, ce.item()))
             if step % args.log_every == 0:
                 el = time.time() - t0
-                gate = float(torch.sigmoid(fusion.gate_logit))
+                gate = float(torch.sigmoid(fusion.gate_logit).detach())
                 extra = f" | js对比 {contrast.item():.4f}" if contrast is not None else ""
                 print(f"epoch {ep + 1} step {step:>6} | CE {ce.item():.4f}{extra} "
                       f"| gate {gate:.5f} | {el:.0f}s")
@@ -364,7 +372,7 @@ def main():
             if eval_loader is not None and step % args.eval_every == 0:
                 f_loss, b_loss = evaluate()
                 eval_history.append((step, f_loss, b_loss))
-                gate = float(torch.sigmoid(fusion.gate_logit))
+                gate = float(torch.sigmoid(fusion.gate_logit).detach())
                 print(f"    [评估] step {step:>6} | fusion {f_loss:.4f} | "
                       f"baseline {b_loss:.4f} | 增益 {b_loss - f_loss:+.4f} "
                       f"(>0=旁路有用) | gate {gate:.5f}")
