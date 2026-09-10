@@ -219,6 +219,14 @@ def load_gsm8k_test(seed: int, limit: int):
 def main():
     parser = argparse.ArgumentParser(description="MATH / GSM8K 分层评测: fusion vs baseline")
     parser.add_argument("--ckpt", default="", help="训练好的 fusion 权重(空=用初始恒等旁路)")
+    parser.add_argument("--lora_ckpt", default="",
+                        help="LoRA 权重目录(给定则评测 LoRA 模型; 与 --ckpt 同给=并行评测两者)")
+    parser.add_argument("--small_start", type=int, default=None,
+                        help="0.6B 旁路起始层(含, 0-based); None=自动 1/3 位置")
+    parser.add_argument("--small_end", type=int, default=None,
+                        help="0.6B 旁路结束层(含, 0-based); -1=最后一层; None=自动 2/3 位置")
+    parser.add_argument("--fusion_device", default="", help="旁路模型设备(空=自动 cuda:0)")
+    parser.add_argument("--lora_device", default="", help="LoRA 模型设备(空=自动另一张卡)")
     parser.add_argument("--bench", default="both", choices=["math", "gsm8k", "both"],
                         help="评测哪个数据集")
     parser.add_argument("--limit", type=int, default=200, help="每个数据集最多评测多少题(0=全部)")
@@ -241,19 +249,69 @@ def main():
                         lambda r: extract_gold_gsm8k(r.get("answer", "")),
                         extract_pred_gsm8k, gsm8k_equal))
 
-    # ── 加载模型 + 旁路 ──
+    # ── 加载模型(旁路 / LoRA / 两者并行) ──
     cfg = Config()
+    if args.small_start is not None:
+        cfg.fusion_small_start = args.small_start
+    if args.small_end is not None:
+        cfg.fusion_small_end = args.small_end
     dt = resolve_dtype(cfg.dtype)
-    small_path = resolve_model_path(cfg.model_small_id, cfg.model_small_local)
     large_path = resolve_model_path(cfg.model_large_id, cfg.model_large_local)
-    tokenizer = AutoTokenizer.from_pretrained(small_path)
-    small = AutoModelForCausalLM.from_pretrained(small_path, dtype=dt).cuda().eval()
-    large = AutoModelForCausalLM.from_pretrained(large_path, dtype=dt).cuda().eval()
-    fusion = attach_fusion(large, small, cfg)
-    if args.ckpt:
-        load_fusion(fusion, args.ckpt)
-    gate = float(torch.sigmoid(fusion.gate_logit).detach())
-    print(f"旁路 gate = {gate:.5f} ({'训练后权重' if args.ckpt else '初始恒等'})")
+
+    # 两个模型可同时挂载(旁路放 fusion 设备, LoRA 放另一张卡), 一次性并行验证两者正确率
+    have_fusion = (not args.lora_ckpt) or bool(args.ckpt)   # 只给 --lora_ckpt 时不上旁路
+    have_lora = bool(args.lora_ckpt)
+
+    tokenizer = None
+    large_f = large_l = None
+    fusion = None
+
+    def _resolve_dev(pref: str, fallback: str) -> str:
+        d = pref or fallback
+        if d.startswith("cuda") and torch.cuda.is_available():
+            idx = int(d.split(":")[-1]) if ":" in d else 0
+            if idx >= torch.cuda.device_count():
+                print(f"    [警告] 设备 {d} 不存在, 退回 cuda:0")
+                return "cuda:0"
+        return d
+
+    if have_fusion:
+        small_path = resolve_model_path(cfg.model_small_id, cfg.model_small_local)
+        tokenizer = AutoTokenizer.from_pretrained(small_path)
+        fdev = _resolve_dev(args.fusion_device, "cuda:0")
+        small = AutoModelForCausalLM.from_pretrained(small_path, dtype=dt).to(fdev).eval()
+        large_f = AutoModelForCausalLM.from_pretrained(large_path, dtype=dt).to(fdev).eval()
+        fusion = attach_fusion(large_f, small, cfg)
+        if args.ckpt:
+            load_fusion(fusion, args.ckpt)
+        gate = float(torch.sigmoid(fusion.gate_logit).detach())
+        print(f"旁路 gate = {gate:.5f} ({'训练后权重' if args.ckpt else '初始恒等'}) "
+              f"(设备 {fdev})")
+
+    if have_lora:
+        from peft import PeftModel
+        if tokenizer is None:
+            tokenizer = AutoTokenizer.from_pretrained(large_path)
+        ldev = _resolve_dev(args.lora_device,
+                            "cuda:1" if torch.cuda.device_count() >= 2 else "cuda:0")
+        large_l = AutoModelForCausalLM.from_pretrained(large_path, dtype=dt).to(ldev).eval()
+        large_l = PeftModel.from_pretrained(large_l, args.lora_ckpt)
+        # 训练存的是 fp32 主权重(配合 autocast bf16 前向); 推理统一回 base 的 dt,
+        # 否则 fp32 LoRA + bf16 base 混合 dtype, 且 PEFT 可能把部分 base 参数带到 fp32
+        large_l = large_l.to(dt)
+        large_l.eval()
+        print(f"已加载 LoRA: {args.lora_ckpt} (设备 {ldev}, dtype {dt})")
+
+    def set_fusion(on: bool):
+        if fusion is not None:
+            fusion.enabled = on
+
+    def set_lora(on: bool):
+        if large_l is not None:
+            if on:
+                large_l.enable_adapter_layers()
+            else:
+                large_l.disable_adapter_layers()
 
     os.makedirs(args.out_dir, exist_ok=True)
     all_summaries = {}
@@ -266,49 +324,81 @@ def main():
             problem = r.get("problem", "")
             gold = gold_fn(r)
             prompt = math_prompt(problem)
-            fusion.enabled = True
-            pred_f = generate(large, tokenizer, prompt, args.max_new)
-            fusion.enabled = False
-            pred_b = "" if args.fusion_only else generate(large, tokenizer, prompt, args.max_new)
-            fusion.enabled = True
-            ans_f = pred_fn(pred_f)
-            ok_f = score_fn(ans_f, gold)
-            rec = {"id": i, "problem": problem, "gold": gold,
-                   "fusion_pred": ans_f, "fusion_correct": ok_f}
+            rec = {"id": i, "problem": problem, "gold": gold}
+
+            # ① 纯 4B baseline(旁路关 = LoRA 关, 二者等价, 只算一次)
             if not args.fusion_only:
-                ans_b = pred_fn(pred_b)
-                ok_b = score_fn(ans_b, gold)
-                rec.update({"baseline_pred": ans_b, "baseline_correct": ok_b})
+                try:
+                    if large_f is not None:
+                        set_fusion(False)
+                        pred_base = generate(large_f, tokenizer, prompt, args.max_new)
+                    else:
+                        set_lora(False)
+                        pred_base = generate(large_l, tokenizer, prompt, args.max_new)
+                finally:
+                    # generate 抛异常也要恢复为开启, 防状态残留污染后续结果
+                    set_fusion(True)
+                    set_lora(True)
+                ans_base = pred_fn(pred_base)
+                rec["baseline_pred"] = ans_base
+                rec["baseline_correct"] = score_fn(ans_base, gold)
+
+            # ② 旁路开
+            if large_f is not None:
+                set_fusion(True)
+                pred_f = generate(large_f, tokenizer, prompt, args.max_new)
+                ans_f = pred_fn(pred_f)
+                rec["fusion_pred"] = ans_f
+                rec["fusion_correct"] = score_fn(ans_f, gold)
+
+            # ③ LoRA 开
+            if large_l is not None:
+                set_lora(True)
+                pred_l = generate(large_l, tokenizer, prompt, args.max_new)
+                ans_l = pred_fn(pred_l)
+                rec["lora_pred"] = ans_l
+                rec["lora_correct"] = score_fn(ans_l, gold)
+
             results.append(rec)
-            acc_f = sum(1 for x in results if x["fusion_correct"]) / i
-            line = f"[{name} {i}/{n}] fusion_acc={acc_f:.3f}"
+            parts = [f"[{name} {i}/{n}]"]
+            if large_f is not None:
+                acc_f = sum(1 for x in results if x.get("fusion_correct")) / i
+                parts.append(f"fusion={acc_f:.3f}")
+            if large_l is not None:
+                acc_l = sum(1 for x in results if x.get("lora_correct")) / i
+                parts.append(f"lora={acc_l:.3f}")
             if not args.fusion_only:
-                acc_b = sum(1 for x in results if x["baseline_correct"]) / i
-                line += f" | baseline_acc={acc_b:.3f}"
-            print(line, flush=True)
+                acc_b = sum(1 for x in results if x.get("baseline_correct")) / i
+                parts.append(f"baseline={acc_b:.3f}")
+            print(" | ".join(parts), flush=True)
 
         n_total = len(results)
-        f_correct = sum(1 for x in results if x["fusion_correct"])
-        summary = {"bench": name, "n": n_total, "fusion_correct": f_correct,
-                   "fusion_acc": round(f_correct / n_total, 4) if n_total else 0}
+        summary = {"bench": name, "n": n_total}
         print("=" * 62)
-        print(f"[{name}] fusion 准确率: {summary['fusion_acc']:.2%} ({f_correct}/{n_total})")
-        if not args.fusion_only:
-            b_correct = sum(1 for x in results if x["baseline_correct"])
-            summary.update({"baseline_correct": b_correct,
-                            "baseline_acc": round(b_correct / n_total, 4)})
-            print(f"[{name}] baseline 准确率: {summary['baseline_acc']:.2%} ({b_correct}/{n_total})")
+        for label in ("baseline", "fusion", "lora"):
+            key = f"{label}_correct"
+            if any(key in x for x in results):
+                c = sum(1 for x in results if x[key])
+                summary[key] = c
+                summary[f"{label}_acc"] = round(c / n_total, 4) if n_total else 0
+                print(f"[{name}] {label} 准确率: {summary[f'{label}_acc']:.2%} ({c}/{n_total})")
+        if results and "fusion_pred" in results[0] and "baseline_pred" in results[0]:
             n_diff = sum(1 for x in results if x.get("fusion_pred") != x.get("baseline_pred"))
             summary["n_answer_changed"] = n_diff
-            print(f"[{name}] 答案不同题数: {n_diff}/{n_total}")
-            print(f"[{name}] 差值(fusion - baseline): {summary['fusion_acc'] - summary['baseline_acc']:+.2%}")
+            print(f"[{name}] 答案不同题数(fusion vs baseline): {n_diff}/{n_total}")
+            print(f"[{name}] 差值(fusion - baseline): "
+                  f"{summary['fusion_acc'] - summary['baseline_acc']:+.2%}")
+        if "fusion_acc" in summary and "lora_acc" in summary:
+            print(f"[{name}] 差值(fusion - lora): {summary['fusion_acc'] - summary['lora_acc']:+.2%}")
         print(f"[{name}] 耗时: {time.time() - t0:.0f}s")
         all_summaries[name] = summary
 
         path = os.path.join(args.out_dir,
                             f"eval_{name.lower()}_{time.strftime('%Y%m%d_%H%M%S')}.json")
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({"ckpt": args.ckpt, "seed": args.seed, "summary": summary,
+            json.dump({"ckpt": args.ckpt, "lora_ckpt": args.lora_ckpt,
+                       "small_start": args.small_start, "small_end": args.small_end,
+                       "seed": args.seed, "summary": summary,
                        "results": results}, f, ensure_ascii=False, indent=2)
         print(f"结果已保存: {path}")
 
@@ -316,11 +406,16 @@ def main():
         print("\n" + "=" * 62)
         print("分层汇总:")
         for name, s in all_summaries.items():
-            if args.fusion_only:
-                print(f"  {name}: fusion {s['fusion_acc']:.2%}")
-            else:
-                print(f"  {name}: fusion {s['fusion_acc']:.2%} | baseline {s['baseline_acc']:.2%} "
-                      f"| 差值 {s['fusion_acc'] - s['baseline_acc']:+.2%}")
+            cols = []
+            for label in ("baseline", "fusion", "lora"):
+                if f"{label}_acc" in s:
+                    cols.append(f"{label} {s[f'{label}_acc']:.2%}")
+            line = f"  {name}: " + " | ".join(cols)
+            if "fusion_acc" in s and "baseline_acc" in s:
+                line += f"  (fusion-baseline {s['fusion_acc'] - s['baseline_acc']:+.2%})"
+            if "fusion_acc" in s and "lora_acc" in s:
+                line += f"  (fusion-lora {s['fusion_acc'] - s['lora_acc']:+.2%})"
+            print(line)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ import math
 import os
 import sys
 import time
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -39,7 +40,8 @@ sys.path.insert(0, os.path.join(_ROOT, "core_training"))
 sys.path.insert(0, os.path.join(_ROOT, "eval"))
 
 from main import (Config, attach_fusion, save_fusion, load_fusion,
-                  model_device, resolve_dtype, resolve_model_path)
+                  model_device, resolve_dtype, resolve_model_path,
+                  resolve_small_range)
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -252,6 +254,10 @@ def main():
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--gate_init", type=float, default=0.0,
                         help="训练起始 gate_logit(0→sigmoid=0.5);-10 会以 4.5e-5 阻塞梯度")
+    parser.add_argument("--small_start", type=int, default=None,
+                        help="0.6B 旁路起始层(含, 0-based); None=自动 1/3 位置")
+    parser.add_argument("--small_end", type=int, default=None,
+                        help="0.6B 旁路结束层(含, 0-based); -1=最后一层; None=自动 2/3 位置")
     parser.add_argument("--grad_checkpoint", type=int, default=0, help="1=梯度检查点(省显存但更慢)")
     parser.add_argument("--batch_size", type=int, default=8, help="训练 batch(H100 可用 8~16)")
     parser.add_argument("--contrast_weight", type=float, default=0.5,
@@ -264,15 +270,20 @@ def main():
     parser.add_argument("--eval_max_samples", type=int, default=400,
                         help="每次评估最多用多少条(0=全部; 验证集大时应设小, 否则每步评估很慢)")
     parser.add_argument("--log_every", type=int, default=10)
-    parser.add_argument("--out", default="cache/fusion_adapter_sft.pt")
+    parser.add_argument("--out", default=None,
+                        help="最终权重路径(默认=自动 cache/fusion_s<起>_<止>_<时间戳>.pt)")
     parser.add_argument("--resume", default="", help="从已保存的旁路参数继续")
     parser.add_argument("--patience", type=int, default=0,
                         help="早停耐心: 连续 N 次评估 fusion loss 无改善就停(0=关闭)")
-    parser.add_argument("--plot", default="cache/train_fusion_loss.png",
-                        help="loss 图保存路径(空=不画)")
+    parser.add_argument("--plot", default=None,
+                        help="loss 图路径(默认=自动带层范围+时间戳; 传空字符串=不画)")
     args = parser.parse_args()
 
     cfg = Config()
+    if args.small_start is not None:
+        cfg.fusion_small_start = args.small_start
+    if args.small_end is not None:
+        cfg.fusion_small_end = args.small_end
     torch.manual_seed(cfg.seed)
     dt = resolve_dtype(cfg.dtype)
     print(f"精度: {dt} | CUDA: {torch.cuda.is_available()}")
@@ -292,6 +303,13 @@ def main():
     for m in (small, large):
         for p in m.parameters():
             p.requires_grad_(False)
+    # 输出文件自动命名: 带旁路层范围 + 时间戳, 避免不同实验互相覆盖
+    n_small = small.config.num_hidden_layers
+    s1, s2 = resolve_small_range(cfg, n_small)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_path = args.out or f"cache/fusion_s{s1}_{s2}_{ts}.pt"
+    plot_path = args.plot if args.plot is not None else f"cache/train_fusion_s{s1}_{s2}_{ts}.png"
+    print(f"输出权重: {out_path} | loss 图: {plot_path}")
     # 梯度检查点需要模型处于 train 模式才生效;Qwen3 attention_dropout=0 无噪声
     large.train()
     small.eval()
@@ -301,6 +319,12 @@ def main():
 
     # ── 挂载门控残差旁路 ──
     fusion = attach_fusion(large, small, cfg)
+    # 关键修复: 适配器参数用 fp32 主权重。attach_fusion 把它们搬到 bf16, 若直接
+    # 让 AdamW 更新 bf16 参数, 梯度小到 bf16 精度(约 3 位有效数字)就归零,
+    # 训练几十步后彻底冻结。这里转回 fp32, 前向用 autocast 做 bf16 计算。
+    # 必须先转 fp32 再 resume: 否则 fp32 检查点会被先压成 bf16 再升回 fp32, 丢尾数。
+    for p in fusion.parameters():
+        p.data = p.data.float()
     if args.resume:
         load_fusion(fusion, args.resume)
     else:
@@ -319,11 +343,6 @@ def main():
         for m in (fusion.adapter1, fusion.adapter2):
             torch.nn.init.normal_(m.up.weight, std=0.02)
             torch.nn.init.zeros_(m.up.bias)
-    # 关键修复: 适配器参数用 fp32 主权重。attach_fusion 把它们搬到 bf16, 若直接
-    # 让 AdamW 更新 bf16 参数, 梯度小到 bf16 精度(约 3 位有效数字)就归零,
-    # 训练几十步后彻底冻结。这里转回 fp32, 前向用 autocast 做 bf16 计算。
-    for p in fusion.parameters():
-        p.data = p.data.float()
     params = [p for p in fusion.parameters() if p.requires_grad]
     n_params = sum(p.numel() for p in params)
     print(f"可训练旁路参数: {n_params / 1e6:.1f}M")
@@ -363,9 +382,12 @@ def main():
         scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
     def forward_logits(ids, mask):
-        # bf16 前向 + fp32 主权重(autocast 自动把适配器的 fp32 权重在计算时降 bf16,
-        # 梯度回传时又升回 fp32, 避免 bf16 精度丢失导致的更新冻结)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        # bf16/fp16 权重用同精度 autocast(前向 bf16 + fp32 主权重, 梯度回传升回 fp32);
+        # fp32 权重则不降精度直接算
+        ctx = torch.autocast("cuda", dtype=dt) \
+            if dt in (torch.bfloat16, torch.float16) and torch.cuda.is_available() \
+            else nullcontext()
+        with ctx:
             out = large.model(input_ids=ids, attention_mask=mask, use_cache=False)
             logits = large.lm_head(out.last_hidden_state)
         return logits
@@ -392,7 +414,7 @@ def main():
         return f_sum / n, b_sum / n
 
     # ── 训练循环 ──
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     fusion.train()
     train_ce_history = []   # (step, ce) 每一步训练 CE
     eval_history = []       # (step, fusion_loss, baseline_loss)
@@ -463,7 +485,7 @@ def main():
                 if f_loss < best_fusion - 1e-4:
                     best_fusion, best_step = f_loss, step
                     patience_counter = 0
-                    torch.save(fusion.state_dict(), args.out + ".best")
+                    save_fusion(fusion, out_path + ".best")
                 else:
                     patience_counter += 1
                 if args.patience > 0 and patience_counter >= args.patience:
@@ -475,11 +497,12 @@ def main():
         if stop:
             break
 
-    save_fusion(fusion, args.out)
-    plot_losses(train_ce_history, eval_history, args.plot)
-    print(f"\n训练完成, 共 {step} 步, 旁路参数已保存: {args.out}")
+    save_fusion(fusion, out_path)
+    if plot_path:
+        plot_losses(train_ce_history, eval_history, plot_path)
+    print(f"\n训练完成, 共 {step} 步, 旁路参数已保存: {out_path}")
     if best_fusion < float("inf"):
-        print(f"最优 fusion loss {best_fusion:.4f} @ step {best_step}, 已保存: {args.out}.best")
+        print(f"最优 fusion loss {best_fusion:.4f} @ step {best_step}, 已保存: {out_path}.best")
     print("验证: 在 test_fusion.py 里 load_fusion 后解码, 或直接跑 python main.py 看效果")
 
 

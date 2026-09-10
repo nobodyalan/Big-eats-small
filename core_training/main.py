@@ -59,6 +59,10 @@ class Config:
     fusion_pos1_frac: float = 1 / 3   # 4B 取隐状态的位置(36 层 → 第 12 层输出)
     fusion_pos2_frac: float = 2 / 3   # 4B 加回残差的位置(第 24 层输出)
     fusion_mlp_dim: int = 4096        # 适配器 MLP 中间层维度(可调; 4096 → 约 44M 旁路参数)
+    # 0.6B 旁路层范围(含端点, 0-based); None = 自动用 1/3~2/3 位置。负索引从末尾数。
+    # 例: start=0, end=-1 → 从第一个隐藏层接到最后一个隐藏层(整段 0.6B)
+    fusion_small_start: Optional[int] = None
+    fusion_small_end: Optional[int] = None
 
     # ── 最终解码 ──────────────────────────────────────────────────────────
     max_new_tokens: int = 512
@@ -276,6 +280,22 @@ class GatedResidualFusion(nn.Module):
         return out * torch.sigmoid(self.gate_logit)
 
 
+def resolve_small_range(config: Config, n_small: int):
+    """解析 0.6B 旁路层范围(含端点, 0-based, 已夹紧合规)。"""
+    s1 = config.fusion_small_start if config.fusion_small_start is not None \
+        else int(config.fusion_pos1_frac * n_small)
+    s2 = config.fusion_small_end if config.fusion_small_end is not None \
+        else int(config.fusion_pos2_frac * n_small)
+    if s1 < 0:      # 负索引从末尾数(-1 = 最后一层)
+        s1 += n_small
+    if s2 < 0:
+        s2 += n_small
+    # 参数合规: 夹到 [0, n_small-1] 且保证 s1 ≤ s2
+    s1 = max(0, min(s1, n_small - 1))
+    s2 = max(s1, min(s2, n_small - 1))
+    return s1, s2
+
+
 def attach_fusion(model_large, model_small, config: Config) -> GatedResidualFusion:
     """
     用前向钩子把门控残差旁路挂到 4B 上:
@@ -287,8 +307,7 @@ def attach_fusion(model_large, model_small, config: Config) -> GatedResidualFusi
     n_small = model_small.config.num_hidden_layers
     l1 = int(config.fusion_pos1_frac * n_large)
     l2 = int(config.fusion_pos2_frac * n_large)
-    s1 = int(config.fusion_pos1_frac * n_small)
-    s2 = int(config.fusion_pos2_frac * n_small)
+    s1, s2 = resolve_small_range(config, n_small)
     fusion = GatedResidualFusion(
         model_small, s1, s2,
         d_large=model_large.config.hidden_size,
@@ -348,12 +367,38 @@ def attach_fusion(model_large, model_small, config: Config) -> GatedResidualFusi
 
 
 def save_fusion(fusion: GatedResidualFusion, path: str):
-    torch.save(fusion.state_dict(), path)
+    """保存旁路参数 + 架构元数据(层范围/维度), 便于加载时校验参数合规性。"""
+    payload = {
+        "state_dict": fusion.state_dict(),
+        "meta": {
+            "small_s1": int(getattr(fusion, "s1", -1)),
+            "small_s2": int(getattr(fusion, "s2", -1)),
+            "mlp_dim": int(fusion.adapter1.down.out_features),
+            "d_large": int(fusion.adapter1.down.in_features),
+            "d_small": int(fusion.adapter1.up.out_features),
+        },
+    }
+    torch.save(payload, path)
     print(f"    旁路参数已保存: {path}")
 
 
 def load_fusion(fusion: GatedResidualFusion, path: str):
-    fusion.load_state_dict(torch.load(path, map_location="cpu"))
+    """加载旁路参数; 兼容旧版裸 state_dict, 并对新格式做层范围/维度校验。"""
+    obj = torch.load(path, map_location="cpu")
+    if isinstance(obj, dict) and "state_dict" in obj:
+        sd = obj["state_dict"]
+        meta = obj.get("meta", {})
+        if meta:
+            cur = (int(getattr(fusion, "s1", -1)), int(getattr(fusion, "s2", -1)),
+                   int(fusion.adapter1.down.out_features))
+            new = (meta.get("small_s1"), meta.get("small_s2"), meta.get("mlp_dim"))
+            if new[0] is not None and cur != (new[0], new[1], new[2]):
+                print(f"    [警告] 检查点层范围/维度与当前不符: "
+                      f"检查点 s1={new[0]} s2={new[1]} mlp={new[2]} "
+                      f"vs 当前 s1={cur[0]} s2={cur[1]} mlp={cur[2]}")
+    else:
+        sd = obj   # 旧版裸 state_dict
+    fusion.load_state_dict(sd)
     print(f"    旁路参数已加载: {path}")
 
 
