@@ -241,7 +241,7 @@ def main():
     parser.add_argument("--max_len", type=int, default=1024, help="单条最大 token 数(显存不足先调小)")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--warmup_steps", type=int, default=300,
-                        help="学习率线性 warmup 步数(0=关闭; 之后余弦衰减到 10%)")
+                        help="学习率线性 warmup 步数(0=关闭; 之后余弦衰减到 10%%)")
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--gate_init", type=float, default=0.0,
                         help="训练起始 gate_logit(0→sigmoid=0.5);-10 会以 4.5e-5 阻塞梯度")

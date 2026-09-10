@@ -120,6 +120,36 @@ def answers_equal(pred, gold) -> bool:
     return False
 
 
+# ────────────────────────────── GSM8K 判分 ──────────────────────────────
+def extract_gold_gsm8k(answer: str):
+    """GSM8K 标准答案形如 '...#### 72', 取 #### 后面的内容"""
+    if not answer:
+        return None
+    m = re.findall(r"####\s*(.+)", answer)
+    return m[-1].strip() if m else None
+
+
+def extract_pred_gsm8k(text: str):
+    """优先取 \boxed{}, 否则取文本最后一个数字"""
+    b = extract_boxed(text)
+    if b is not None:
+        return b
+    nums = re.findall(r"-?\d[\d,]*(?:\.\d+)?", text)
+    return nums[-1] if nums else None
+
+
+def gsm8k_equal(pred, gold) -> bool:
+    """GSM8K 判分: 数值匹配(容差 1e-6); 解析不了时退化为字符串匹配"""
+    if pred is None or gold is None:
+        return False
+    def to_num(s):
+        return float(str(s).replace(",", "").replace("$", "").replace("%", "").strip())
+    try:
+        return abs(to_num(pred) - to_num(gold)) < 1e-6
+    except Exception:
+        return str(pred).strip() == str(gold).strip()
+
+
 # ────────────────────────────── 数据与生成 ──────────────────────────────
 def load_test_problems(zip_path: str, seed: int, limit: int):
     zf = zipfile.ZipFile(zip_path)
@@ -159,11 +189,39 @@ def ensure_zip(zip_path: str):
         download_file(ZIP_URL, zip_path)
 
 
+# ────────────────────────────── GSM8K 数据 ──────────────────────────────
+GSM8K_TEST_URL = "https://modelscope.cn/datasets/AI-ModelScope/gsm8k/resolve/master/main/test-00000-of-00001.parquet"
+GSM8K_TEST_PATH = "data/.cache/gsm8k_test.parquet"
+
+
+def ensure_gsm8k():
+    if not os.path.exists(GSM8K_TEST_PATH):
+        print(f"GSM8K test 缺失, 开始下载: {GSM8K_TEST_URL}")
+        download_file(GSM8K_TEST_URL, GSM8K_TEST_PATH)
+
+
+def load_gsm8k_test(seed: int, limit: int):
+    """读 GSM8K test(1319 题), 返回 [{"problem": question, "answer": answer}]"""
+    ensure_gsm8k()
+    import pyarrow.parquet as pq
+    t = pq.read_table(GSM8K_TEST_PATH)
+    qs = t.column("question").to_pylist()
+    ans = t.column("answer").to_pylist()
+    items = [{"problem": q, "answer": a} for q, a in zip(qs, ans)]
+    rng = random.Random(seed)
+    rng.shuffle(items)
+    if limit > 0:
+        items = items[:limit]
+    return items
+
+
 # ────────────────────────────── 主流程 ──────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="MATH test 划分最终答案准确率评测")
+    parser = argparse.ArgumentParser(description="MATH / GSM8K 分层评测: fusion vs baseline")
     parser.add_argument("--ckpt", default="", help="训练好的 fusion 权重(空=用初始恒等旁路)")
-    parser.add_argument("--limit", type=int, default=200, help="最多评测多少题(0=全部 5000)")
+    parser.add_argument("--bench", default="both", choices=["math", "gsm8k", "both"],
+                        help="评测哪个数据集")
+    parser.add_argument("--limit", type=int, default=200, help="每个数据集最多评测多少题(0=全部)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_new", type=int, default=512)
     parser.add_argument("--zip", default=ZIP_PATH)
@@ -171,9 +229,17 @@ def main():
     parser.add_argument("--out_dir", default="eval_results")
     args = parser.parse_args()
 
-    ensure_zip(args.zip)
-    problems = load_test_problems(args.zip, args.seed, args.limit)
-    print(f"评测题数: {len(problems)} (MATH test 划分, seed={args.seed})")
+    # ── 选择 benchmark(数据 + 判分函数) ──
+    benches = []
+    if args.bench in ("math", "both"):
+        ensure_zip(args.zip)
+        benches.append(("MATH", load_test_problems(args.zip, args.seed, args.limit),
+                        lambda r: extract_boxed(r.get("solution", "")),
+                        extract_boxed, answers_equal))
+    if args.bench in ("gsm8k", "both"):
+        benches.append(("GSM8K", load_gsm8k_test(args.seed, args.limit),
+                        lambda r: extract_gold_gsm8k(r.get("answer", "")),
+                        extract_pred_gsm8k, gsm8k_equal))
 
     # ── 加载模型 + 旁路 ──
     cfg = Config()
@@ -190,74 +256,71 @@ def main():
     print(f"旁路 gate = {gate:.5f} ({'训练后权重' if args.ckpt else '初始恒等'})")
 
     os.makedirs(args.out_dir, exist_ok=True)
-    results = []
-    t0 = time.time()
-    n = len(problems)
-    for i, r in enumerate(problems, 1):
-        problem = r.get("problem", "")
-        gold = extract_boxed(r.get("solution", ""))
-        prompt = math_prompt(problem)
+    all_summaries = {}
+    for name, items, gold_fn, pred_fn, score_fn in benches:
+        results = []
+        t0 = time.time()
+        n = len(items)
+        print(f"\n===== 评测 {name} ({n} 题, seed={args.seed}) =====")
+        for i, r in enumerate(items, 1):
+            problem = r.get("problem", "")
+            gold = gold_fn(r)
+            prompt = math_prompt(problem)
+            fusion.enabled = True
+            pred_f = generate(large, tokenizer, prompt, args.max_new)
+            fusion.enabled = False
+            pred_b = "" if args.fusion_only else generate(large, tokenizer, prompt, args.max_new)
+            fusion.enabled = True
+            ans_f = pred_fn(pred_f)
+            ok_f = score_fn(ans_f, gold)
+            rec = {"id": i, "problem": problem, "gold": gold,
+                   "fusion_pred": ans_f, "fusion_correct": ok_f}
+            if not args.fusion_only:
+                ans_b = pred_fn(pred_b)
+                ok_b = score_fn(ans_b, gold)
+                rec.update({"baseline_pred": ans_b, "baseline_correct": ok_b})
+            results.append(rec)
+            acc_f = sum(1 for x in results if x["fusion_correct"]) / i
+            line = f"[{name} {i}/{n}] fusion_acc={acc_f:.3f}"
+            if not args.fusion_only:
+                acc_b = sum(1 for x in results if x["baseline_correct"]) / i
+                line += f" | baseline_acc={acc_b:.3f}"
+            print(line, flush=True)
 
-        fusion.enabled = True
-        pred_f = generate(large, tokenizer, prompt, args.max_new)
-        fusion.enabled = False
-        pred_b = "" if args.fusion_only else generate(large, tokenizer, prompt, args.max_new)
-        fusion.enabled = True
-
-        ans_f = extract_boxed(pred_f)
-        ok_f = answers_equal(ans_f, gold)
-        rec = {
-            "id": i, "level": r.get("level"), "type": r.get("type"),
-            "problem": problem, "gold": gold,
-            "fusion_pred": ans_f, "fusion_correct": ok_f,
-        }
+        n_total = len(results)
+        f_correct = sum(1 for x in results if x["fusion_correct"])
+        summary = {"bench": name, "n": n_total, "fusion_correct": f_correct,
+                   "fusion_acc": round(f_correct / n_total, 4) if n_total else 0}
+        print("=" * 62)
+        print(f"[{name}] fusion 准确率: {summary['fusion_acc']:.2%} ({f_correct}/{n_total})")
         if not args.fusion_only:
-            ans_b = extract_boxed(pred_b)
-            ok_b = answers_equal(ans_b, gold)
-            rec.update({"baseline_pred": ans_b, "baseline_correct": ok_b})
-        results.append(rec)
+            b_correct = sum(1 for x in results if x["baseline_correct"])
+            summary.update({"baseline_correct": b_correct,
+                            "baseline_acc": round(b_correct / n_total, 4)})
+            print(f"[{name}] baseline 准确率: {summary['baseline_acc']:.2%} ({b_correct}/{n_total})")
+            n_diff = sum(1 for x in results if x.get("fusion_pred") != x.get("baseline_pred"))
+            summary["n_answer_changed"] = n_diff
+            print(f"[{name}] 答案不同题数: {n_diff}/{n_total}")
+            print(f"[{name}] 差值(fusion - baseline): {summary['fusion_acc'] - summary['baseline_acc']:+.2%}")
+        print(f"[{name}] 耗时: {time.time() - t0:.0f}s")
+        all_summaries[name] = summary
 
-        # 中间统计
-        acc_f = sum(1 for x in results if x["fusion_correct"]) / i
-        line = f"[{i}/{n}] fusion_acc={acc_f:.3f}"
-        if not args.fusion_only:
-            acc_b = sum(1 for x in results if x["baseline_correct"]) / i
-            line += f" | baseline_acc={acc_b:.3f}"
-        print(line, flush=True)
+        path = os.path.join(args.out_dir,
+                            f"eval_{name.lower()}_{time.strftime('%Y%m%d_%H%M%S')}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"ckpt": args.ckpt, "seed": args.seed, "summary": summary,
+                       "results": results}, f, ensure_ascii=False, indent=2)
+        print(f"结果已保存: {path}")
 
-    # ── 汇总 ──
-    n_total = len(results)
-    f_correct = sum(1 for x in results if x["fusion_correct"])
-    f_extract = sum(1 for x in results if x["fusion_pred"] is not None)
-    summary = {
-        "n": n_total,
-        "fusion_correct": f_correct,
-        "fusion_acc": round(f_correct / n_total, 4) if n_total else 0,
-        "fusion_extract_rate": round(f_extract / n_total, 4) if n_total else 0,
-    }
-    print("=" * 62)
-    print(f"fusion 准确率: {summary['fusion_acc']:.2%} ({f_correct}/{n_total})")
-    print(f"fusion 答案抽取率: {summary['fusion_extract_rate']:.2%}")
-    if not args.fusion_only:
-        b_correct = sum(1 for x in results if x["baseline_correct"])
-        b_extract = sum(1 for x in results if x["baseline_pred"] is not None)
-        summary.update({
-            "baseline_correct": b_correct,
-            "baseline_acc": round(b_correct / n_total, 4),
-            "baseline_extract_rate": round(b_extract / n_total, 4),
-        })
-        print(f"baseline 准确率: {summary['baseline_acc']:.2%} ({b_correct}/{n_total})")
-        n_diff = sum(1 for x in results if x.get("fusion_pred") != x.get("baseline_pred"))
-        print(f"最终答案与 baseline 不同的题数: {n_diff}/{n_total}")
-        summary["n_answer_changed"] = n_diff
-        print(f"差值(fusion - baseline): {summary['fusion_acc'] - summary['baseline_acc']:+.2%}")
-    print(f"总耗时: {time.time() - t0:.0f}s")
-
-    path = os.path.join(args.out_dir, f"math_eval_{time.strftime('%Y%m%d_%H%M%S')}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"ckpt": args.ckpt, "seed": args.seed, "summary": summary,
-                   "results": results}, f, ensure_ascii=False, indent=2)
-    print(f"结果已保存: {path}")
+    if len(benches) > 1:
+        print("\n" + "=" * 62)
+        print("分层汇总:")
+        for name, s in all_summaries.items():
+            if args.fusion_only:
+                print(f"  {name}: fusion {s['fusion_acc']:.2%}")
+            else:
+                print(f"  {name}: fusion {s['fusion_acc']:.2%} | baseline {s['baseline_acc']:.2%} "
+                      f"| 差值 {s['fusion_acc'] - s['baseline_acc']:+.2%}")
 
 
 if __name__ == "__main__":

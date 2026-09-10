@@ -63,8 +63,8 @@ def main():
     parser.add_argument("--en", default="data/math_train.jsonl", help="英文 jsonl")
     parser.add_argument("--zh_train", type=int, default=20000, help="中文训练条数")
     parser.add_argument("--en_train", type=int, default=6000, help="英文训练条数(英文池仅 7500, 需留出验证)")
-    parser.add_argument("--zh_val", type=int, default=4000, help="中文验证条数(默认=训练集的 20%)")
-    parser.add_argument("--en_val", type=int, default=1200, help="英文验证条数(默认=训练集的 20%)")
+    parser.add_argument("--zh_val", type=int, default=4000, help="中文验证条数(默认=训练集的 20%%)")
+    parser.add_argument("--en_val", type=int, default=1200, help="英文验证条数(默认=训练集的 20%%)")
     parser.add_argument("--out_train", default="data/mix_train.jsonl")
     parser.add_argument("--out_val", default="data/mix_val.jsonl")
     parser.add_argument("--out_combined", default="",
