@@ -143,10 +143,12 @@ def math_prompt(problem: str) -> str:
 
 def generate(model, tokenizer, prompt: str, max_new: int) -> str:
     text = build_prompt_text(tokenizer, prompt)
-    ids = tokenizer(text, return_tensors="pt").input_ids.to(next(model.parameters()).device)
+    tok = tokenizer(text, return_tensors="pt")
+    ids = tok.input_ids.to(next(model.parameters()).device)
+    amask = tok.attention_mask.to(ids.device)
     with torch.inference_mode():
-        out = model.generate(ids, max_new_tokens=max_new, do_sample=False,
-                             pad_token_id=tokenizer.eos_token_id,
+        out = model.generate(ids, attention_mask=amask, max_new_tokens=max_new,
+                             do_sample=False, pad_token_id=tokenizer.eos_token_id,
                              eos_token_id=tokenizer.eos_token_id)
     return tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
 
