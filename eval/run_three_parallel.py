@@ -52,6 +52,7 @@ def main():
     parser.add_argument("--limit", type=int, default=400)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_new", type=int, default=512)
+    parser.add_argument("--math_level", type=int, default=0, help="只测 MATH 指定难度(0=全部)")
     parser.add_argument("--out_dir", default="eval_results")
     parser.add_argument("--tag", default="", help="汇总表文件名标签")
     args = parser.parse_args()
@@ -60,7 +61,10 @@ def main():
     base = [sys.executable, EVAL_PY,
             "--bench", args.bench, "--limit", str(args.limit),
             "--seed", str(args.seed), "--max_new", str(args.max_new),
+            "--fusion_only",          # 不再跑裸 4B baseline, 只输出各模型正确率
             "--out_dir", args.out_dir]
+    if args.math_level:
+        base += ["--math_level", str(args.math_level)]
 
     jobs = []
     if args.old_ckpt:
@@ -89,35 +93,30 @@ def main():
         print(f"[{name}] 退出码 {rc} (日志: {log_path})")
 
     # ── 汇总 ──
-    benches = [b for b in ("MATH", "GSM8K") if args.bench in (b.lower(), "both")]
+    if args.bench == "aime":
+        benches = ["AIME"]
+    else:
+        benches = []
+        if args.bench in ("math", "both"):
+            benches.append(f"MATH_L{args.math_level}" if args.math_level else "MATH")
+        if args.bench in ("gsm8k", "both"):
+            benches.append("GSM8K")
     table = {"meta": {"seed": args.seed, "limit": args.limit, "bench": args.bench,
                       "old_ckpt": args.old_ckpt, "full_ckpt": args.full_ckpt,
                       "lora_ckpt": args.lora_ckpt}}
     print("\n" + "=" * 78)
-    print(f"三模型对比 (seed={args.seed}, 每数据集 {args.limit} 题)")
+    print(f"三模型正确率对比 (seed={args.seed}, 每数据集 {args.limit} 题, 不含 baseline)")
     print("=" * 78)
     for bench in benches:
         cols = {}
-        baseline = None
         for name, _ in jobs:
             r = load_summary(args.out_dir, bench, name)
-            if r is None:
-                cols[name] = None
-                continue
-            cols[name] = r["model_acc"]
-            if r["baseline_acc"] is not None and baseline is None:
-                baseline = r["baseline_acc"]
-        table[bench] = {"baseline_acc": baseline,
-                        **{f"{name}_acc": v for name, v in cols.items()}}
-        parts = [f"[{bench}] baseline {baseline:.2%}" if baseline is not None
-                 else f"[{bench}] baseline N/A"]
+            cols[name] = r["model_acc"] if r else None
+        table[bench] = {f"{name}_acc": v for name, v in cols.items()}
+        parts = [f"[{bench}]"]
         for name, _ in jobs:
             v = cols[name]
-            if v is None:
-                parts.append(f"{name} N/A")
-            else:
-                d = "" if baseline is None else f" ({v - baseline:+.2%})"
-                parts.append(f"{name} {v:.2%}{d}")
+            parts.append(f"{name} {'N/A' if v is None else f'{v:.2%}'}")
         print(" | ".join(parts))
 
     out_json = os.path.join(args.out_dir,

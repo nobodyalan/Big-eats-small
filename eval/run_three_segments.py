@@ -55,7 +55,8 @@ def main():
     base = [sys.executable, EVAL_PY, "--bench", "segments",
             "--limit", str(args.limit), "--seed", str(args.seed),
             "--max_new", str(args.max_new), "--math_lo", args.math_lo,
-            "--math_hi", args.math_hi, "--out_dir", args.out_dir]
+            "--math_hi", args.math_hi, "--fusion_only",
+            "--out_dir", args.out_dir]
 
     jobs = []
     if args.old_ckpt:
@@ -90,27 +91,18 @@ def main():
                       "old_ckpt": args.old_ckpt, "full_ckpt": args.full_ckpt,
                       "lora_ckpt": args.lora_ckpt}}
     print("\n" + "=" * 92)
-    print(f"三模型 × 三段对比 (seed={args.seed}, 每段 {args.limit} 题)")
+    print(f"三模型 × 三段正确率对比 (seed={args.seed}, 每段 {args.limit} 题, 不含 baseline)")
     print("=" * 92)
     for label, seg_name in segs:
-        baseline = None
         cols = {}
         for name, _ in jobs:
             r = read_summary(args.out_dir, seg_name, name)
             cols[name] = r["model_acc"] if r else None
-            if r and r["baseline_acc"] is not None and baseline is None:
-                baseline = r["baseline_acc"]
-        table[seg_name] = {"baseline_acc": baseline,
-                           **{f"{n}_acc": v for n, v in cols.items()}}
-        parts = [f"[{label}] baseline {baseline:.2%}" if baseline is not None
-                 else f"[{label}] baseline N/A"]
+        table[seg_name] = {f"{n}_acc": v for n, v in cols.items()}
+        parts = [f"[{label}]"]
         for name, _ in jobs:
             v = cols[name]
-            if v is None:
-                parts.append(f"{name} N/A")
-            else:
-                d = "" if baseline is None else f" ({v - baseline:+.2%})"
-                parts.append(f"{name} {v:.2%}{d}")
+            parts.append(f"{name} {'N/A' if v is None else f'{v:.2%}'}")
         print(" | ".join(parts))
 
     out_json = os.path.join(args.out_dir,
