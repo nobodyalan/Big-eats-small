@@ -209,10 +209,11 @@ def main():
                                  output_hidden_states=True, use_cache=False).hidden_states
                 sh = small.model(input_ids=ids, attention_mask=mask,
                                  output_hidden_states=True, use_cache=False).hidden_states
-            x_seq = bh[L + 1]                       # (1, Lseq, d_large)
-            y_native = sh[a]                        # (1, Lseq, d_small)
-            mapped = (x_seq @ A + c).to(y_native.dtype)   # (1, Lseq, d_small), 对齐小模型 dtype
-            m = mask.bool()
+            x_seq = bh[L + 1]                       # (1, Lseq, d_large), bf16
+            y_native = sh[a]                        # (1, Lseq, d_small), bf16
+            # A 是 fp32, 先转 x_seq 再乘, 最后对齐小模型 dtype
+            mapped = (x_seq.float() @ A + c).to(y_native.dtype)
+            m = mask.bool()[0]                      # (Lseq,) 一维有效位置掩码
             with torch.no_grad():
                 native_outs = run_small_segment_scan(small.model, y_native, a)
                 mapped_outs = run_small_segment_scan(small.model, mapped, a)
