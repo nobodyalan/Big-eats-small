@@ -19,6 +19,9 @@ eval_results/
 .vscode/
 .idea/
 
+# ── 文档 PDF(本地参考, 不入库) ───────────────────────────
+big-small-approaches.pdf
+
 # ── Jupyter ─────────────────────────────────────────────
 .ipynb_checkpoints/
 

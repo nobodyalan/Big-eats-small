@@ -59,6 +59,9 @@ class Config:
     fusion_pos1_frac: float = 1 / 3   # 4B 取隐状态的位置(36 层 → 第 12 层输出)
     fusion_pos2_frac: float = 2 / 3   # 4B 加回残差的位置(第 24 层输出)
     fusion_mlp_dim: int = 4096        # 适配器 MLP 中间层维度(可调; 4096 → 约 44M 旁路参数)
+    # 4B 接入位置(取隐状态层/加回残差层, 0-based); None = 自动用 1/3 / 2/3 位置
+    fusion_large_start: Optional[int] = None
+    fusion_large_end: Optional[int] = None
     # 0.6B 旁路层范围(含端点, 0-based); None = 自动用 1/3~2/3 位置。负索引从末尾数。
     # 例: start=0, end=-1 → 从第一个隐藏层接到最后一个隐藏层(整段 0.6B)
     fusion_small_start: Optional[int] = None
@@ -296,6 +299,17 @@ def resolve_small_range(config: Config, n_small: int):
     return s1, s2
 
 
+def resolve_large_range(config: Config, n_large: int):
+    """解析 4B 接入位置(取隐状态层 l1, 加回残差层 l2; 0-based, 已夹紧, 保证 l2 > l1)。"""
+    l1 = config.fusion_large_start if config.fusion_large_start is not None \
+        else int(config.fusion_pos1_frac * n_large)
+    l2 = config.fusion_large_end if config.fusion_large_end is not None \
+        else int(config.fusion_pos2_frac * n_large)
+    l1 = max(0, min(l1, n_large - 2))
+    l2 = max(l1 + 1, min(l2, n_large - 1))
+    return l1, l2
+
+
 def attach_fusion(model_large, model_small, config: Config) -> GatedResidualFusion:
     """
     用前向钩子把门控残差旁路挂到 4B 上:
@@ -305,8 +319,7 @@ def attach_fusion(model_large, model_small, config: Config) -> GatedResidualFusi
     """
     n_large = model_large.config.num_hidden_layers
     n_small = model_small.config.num_hidden_layers
-    l1 = int(config.fusion_pos1_frac * n_large)
-    l2 = int(config.fusion_pos2_frac * n_large)
+    l1, l2 = resolve_large_range(config, n_large)
     s1, s2 = resolve_small_range(config, n_small)
     fusion = GatedResidualFusion(
         model_small, s1, s2,

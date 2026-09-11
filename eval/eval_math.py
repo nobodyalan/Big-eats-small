@@ -151,18 +151,42 @@ def gsm8k_equal(pred, gold) -> bool:
 
 
 # ────────────────────────────── 数据与生成 ──────────────────────────────
-def load_test_problems(zip_path: str, seed: int, limit: int):
+def parse_levels(spec):
+    """把 '5' / '1,2,3' / '1-3' / '4-5' 解析成 int 集合; 空/0/None=全部(None)"""
+    if spec in (None, "", "0"):
+        return None
+    s = set()
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            s.update(range(int(lo), int(hi) + 1))
+        else:
+            s.add(int(part))
+    return s or None
+
+
+def load_test_problems(zip_path: str, seed: int, limit: int, levels=None):
+    """读 MATH test; levels 为 int 集合(如 {1,2,3})或 None=全部"""
     zf = zipfile.ZipFile(zip_path)
     prefix = "MATH/test/"
     names = [n for n in zf.namelist() if n.startswith(prefix) and n.endswith(".json")]
-    rng = random.Random(seed)
-    rng.shuffle(names)
-    if limit > 0:
-        names = names[:limit]
     probs = []
-    for name in names:      # 保持 shuffle 后的随机顺序(不要 sorted, 否则会按学科排序)
+    for name in names:
         with zf.open(name) as f:
-            probs.append(json.load(f))
+            p = json.load(f)
+            if levels is not None:
+                lv = str(p.get("level", "")).lower()
+                digits = "".join(ch for ch in lv if ch.isdigit())
+                if not digits or int(digits) not in levels:
+                    continue
+            probs.append(p)
+    rng = random.Random(seed)
+    rng.shuffle(probs)       # 保持随机顺序(不要 sorted, 否则会按学科排序)
+    if limit > 0:
+        probs = probs[:limit]
     return probs
 
 
@@ -215,6 +239,28 @@ def load_gsm8k_test(seed: int, limit: int):
     return items
 
 
+# ────────────────────────────── AIME 数据 ──────────────────────────────
+AIME_PATH = "data/aime_test.jsonl"
+
+
+def load_aime_test(seed: int, limit: int):
+    """读 AIME(比 MATH 更难, 整数答案 0-999), 返回 [{"problem","answer"}]"""
+    if not os.path.exists(AIME_PATH):
+        raise SystemExit(f"[错误] 缺 AIME 数据 {AIME_PATH}, 先跑 scripts/download_aime.py")
+    items = []
+    with open(AIME_PATH, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            items.append(json.loads(line))
+    rng = random.Random(seed)
+    rng.shuffle(items)
+    if limit > 0:
+        items = items[:limit]
+    return items
+
+
 # ────────────────────────────── 主流程 ──────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="MATH / GSM8K 分层评测: fusion vs baseline")
@@ -225,29 +271,62 @@ def main():
                         help="0.6B 旁路起始层(含, 0-based); None=自动 1/3 位置")
     parser.add_argument("--small_end", type=int, default=None,
                         help="0.6B 旁路结束层(含, 0-based); -1=最后一层; None=自动 2/3 位置")
+    parser.add_argument("--large_start", type=int, default=None,
+                        help="4B 取隐状态层(含, 0-based); None=自动 1/3 位置")
+    parser.add_argument("--large_end", type=int, default=None,
+                        help="4B 加回残差层(含, 0-based); None=自动 2/3 位置")
     parser.add_argument("--fusion_device", default="", help="旁路模型设备(空=自动 cuda:0)")
     parser.add_argument("--lora_device", default="", help="LoRA 模型设备(空=自动另一张卡)")
-    parser.add_argument("--bench", default="both", choices=["math", "gsm8k", "both"],
-                        help="评测哪个数据集")
+    parser.add_argument("--bench", default="both",
+                        choices=["math", "gsm8k", "both", "aime", "segments"],
+                        help="评测哪个数据集(math/gsm8k/both/aime/segments)")
     parser.add_argument("--limit", type=int, default=200, help="每个数据集最多评测多少题(0=全部)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_new", type=int, default=512)
     parser.add_argument("--zip", default=ZIP_PATH)
+    parser.add_argument("--math_level", type=int, default=0,
+                        help="只测 MATH 指定难度(1~5, 0=全部)")
+    parser.add_argument("--math_lo", default="1-3",
+                        help="segments 模式下 MATH 低级区间(如 1-3 / 1,2,3)")
+    parser.add_argument("--math_hi", default="4-5",
+                        help="segments 模式下 MATH 高级区间(如 4-5 / 5)")
     parser.add_argument("--fusion_only", action="store_true", help="只测 fusion, 跳过 baseline")
     parser.add_argument("--out_dir", default="eval_results")
+    parser.add_argument("--tag", default="", help="输出文件名标签(并行多模型评测时用于区分)")
     args = parser.parse_args()
 
     # ── 选择 benchmark(数据 + 判分函数) ──
     benches = []
     if args.bench in ("math", "both"):
         ensure_zip(args.zip)
-        benches.append(("MATH", load_test_problems(args.zip, args.seed, args.limit),
+        lv = {args.math_level} if args.math_level else None
+        lname = f"MATH_L{args.math_level}" if args.math_level else "MATH"
+        benches.append((lname, load_test_problems(args.zip, args.seed, args.limit, levels=lv),
                         lambda r: extract_boxed(r.get("solution", "")),
                         extract_boxed, answers_equal))
     if args.bench in ("gsm8k", "both"):
         benches.append(("GSM8K", load_gsm8k_test(args.seed, args.limit),
                         lambda r: extract_gold_gsm8k(r.get("answer", "")),
                         extract_pred_gsm8k, gsm8k_equal))
+    if args.bench == "aime":
+        benches.append(("AIME", load_aime_test(args.seed, args.limit),
+                        lambda r: str(r.get("answer", "")).strip(),
+                        extract_pred_gsm8k, gsm8k_equal))
+    if args.bench == "segments":
+        # 三段: GSM8K + MATH 低级 + MATH 高级(同一 seed → 各段题目一致)
+        ensure_zip(args.zip)
+        lo, hi = parse_levels(args.math_lo), parse_levels(args.math_hi)
+        benches.append(("GSM8K", load_gsm8k_test(args.seed, args.limit),
+                        lambda r: extract_gold_gsm8k(r.get("answer", "")),
+                        extract_pred_gsm8k, gsm8k_equal))
+        benches.append((f"MATH_lo{args.math_lo}",
+                        load_test_problems(args.zip, args.seed, args.limit, levels=lo),
+                        lambda r: extract_boxed(r.get("solution", "")),
+                        extract_boxed, answers_equal))
+        benches.append((f"MATH_hi{args.math_hi}",
+                        load_test_problems(args.zip, args.seed, args.limit, levels=hi),
+                        lambda r: extract_boxed(r.get("solution", "")),
+                        extract_boxed, answers_equal))
 
     # ── 加载模型(旁路 / LoRA / 两者并行) ──
     cfg = Config()
@@ -255,6 +334,10 @@ def main():
         cfg.fusion_small_start = args.small_start
     if args.small_end is not None:
         cfg.fusion_small_end = args.small_end
+    if args.large_start is not None:
+        cfg.fusion_large_start = args.large_start
+    if args.large_end is not None:
+        cfg.fusion_large_end = args.large_end
     dt = resolve_dtype(cfg.dtype)
     large_path = resolve_model_path(cfg.model_large_id, cfg.model_large_local)
 
@@ -393,8 +476,9 @@ def main():
         print(f"[{name}] 耗时: {time.time() - t0:.0f}s")
         all_summaries[name] = summary
 
+        tag = f"_{args.tag}" if args.tag else ""
         path = os.path.join(args.out_dir,
-                            f"eval_{name.lower()}_{time.strftime('%Y%m%d_%H%M%S')}.json")
+                            f"eval_{name.lower()}{tag}_{time.strftime('%Y%m%d_%H%M%S')}.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"ckpt": args.ckpt, "lora_ckpt": args.lora_ckpt,
                        "small_start": args.small_start, "small_end": args.small_end,

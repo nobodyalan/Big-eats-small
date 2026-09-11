@@ -41,7 +41,7 @@ sys.path.insert(0, os.path.join(_ROOT, "eval"))
 
 from main import (Config, attach_fusion, save_fusion, load_fusion,
                   model_device, resolve_dtype, resolve_model_path,
-                  resolve_small_range)
+                  resolve_small_range, resolve_large_range)
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -261,6 +261,10 @@ def main():
                         help="0.6B 旁路起始层(含, 0-based); None=自动 1/3 位置")
     parser.add_argument("--small_end", type=int, default=None,
                         help="0.6B 旁路结束层(含, 0-based); -1=最后一层; None=自动 2/3 位置")
+    parser.add_argument("--large_start", type=int, default=None,
+                        help="4B 取隐状态层(含, 0-based); None=自动 1/3 位置")
+    parser.add_argument("--large_end", type=int, default=None,
+                        help="4B 加回残差层(含, 0-based); None=自动 2/3 位置")
     parser.add_argument("--grad_checkpoint", type=int, default=0, help="1=梯度检查点(省显存但更慢)")
     parser.add_argument("--batch_size", type=int, default=8, help="训练 batch(H100 可用 8~16)")
     parser.add_argument("--contrast_weight", type=float, default=0.5,
@@ -289,6 +293,10 @@ def main():
         cfg.fusion_small_start = args.small_start
     if args.small_end is not None:
         cfg.fusion_small_end = args.small_end
+    if args.large_start is not None:
+        cfg.fusion_large_start = args.large_start
+    if args.large_end is not None:
+        cfg.fusion_large_end = args.large_end
     torch.manual_seed(cfg.seed)
     dt = resolve_dtype(cfg.dtype)
     print(f"精度: {dt} | CUDA: {torch.cuda.is_available()}")
@@ -310,12 +318,14 @@ def main():
     for m in (small, large):
         for p in m.parameters():
             p.requires_grad_(False)
-    # 输出文件自动命名: 带旁路层范围 + 时间戳, 避免不同实验互相覆盖
+    # 输出文件自动命名: 带大模型位置 + 旁路层范围 + 时间戳, 避免不同实验互相覆盖
     n_small = small.config.num_hidden_layers
     s1, s2 = resolve_small_range(cfg, n_small)
+    l1, l2 = resolve_large_range(cfg, large.config.num_hidden_layers)
     ts = time.strftime("%Y%m%d_%H%M%S")
-    out_path = args.out or f"cache/fusion_s{s1}_{s2}_{ts}.pt"
-    plot_path = args.plot if args.plot is not None else f"cache/train_fusion_s{s1}_{s2}_{ts}.png"
+    out_path = args.out or f"cache/fusion_L{l1}-{l2}_s{s1}_{s2}_{ts}.pt"
+    plot_path = args.plot if args.plot is not None else f"cache/train_fusion_L{l1}-{l2}_s{s1}_{s2}_{ts}.png"
+    print(f"接入位置: 4B 第{l1}层取 → 第{l2}层加回 | 0.6B 第{s1}~{s2}层")
     print(f"输出权重: {out_path} | loss 图: {plot_path}")
     # 梯度检查点需要模型处于 train 模式才生效;Qwen3 attention_dropout=0 无噪声
     large.train()
