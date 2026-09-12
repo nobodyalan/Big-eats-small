@@ -10,9 +10,10 @@ OUT_ROOT="${OUT_ROOT:-cache/capacity_lora_experiments}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
 EPOCHS="${EPOCHS:-3}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
-MAX_LEN="${MAX_LEN:-1024}"
+MAX_LEN="${MAX_LEN:-1536}"
 EVAL_SAMPLES="${EVAL_SAMPLES:-2000}"
-EVAL_EVERY="${EVAL_EVERY:-100}"
+EVAL_EVERY="${EVAL_EVERY:-500}"
+EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-400}"
 ACC_LIMIT="${ACC_LIMIT:-400}"
 MATH_LO="${MATH_LO:-1-3}"
 MATH_HI="${MATH_HI:-4-5}"
@@ -20,6 +21,8 @@ MAX_NEW="${MAX_NEW:-1024}"
 SEED="${SEED:-42}"
 RUN_EVAL="${RUN_EVAL:-1}"
 ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
+WARMUP_STEPS="${WARMUP_STEPS:-400}"
+GATE_INIT="${GATE_INIT:--2.0}"
 
 # 可选位置覆盖。small_end 沿用 train_fusion 的 inclusive 语义。
 POS_ARGS=()
@@ -31,8 +34,9 @@ POS_ARGS=()
 COMMON=(--data "$DATA" --max_samples "$MAX_SAMPLES" --epochs "$EPOCHS"
         --batch_size "$BATCH_SIZE" --max_len "$MAX_LEN"
         --eval_samples "$EVAL_SAMPLES" --eval_every "$EVAL_EVERY"
-        --warmup_steps 100 --grad_checkpoint 1 --attn_impl "$ATTN_IMPL"
-        --contrast_weight 0 --seed "$SEED")
+        --eval_max_samples "$EVAL_MAX_SAMPLES" --warmup_steps "$WARMUP_STEPS"
+        --grad_checkpoint 1 --attn_impl "$ATTN_IMPL"
+        --contrast_weight 0 --gate_init "$GATE_INIT" --seed "$SEED")
 
 mkdir -p "$OUT_ROOT"
 
@@ -89,7 +93,8 @@ CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" core_training/train_lora.py \
   --data "$DATA" --max_samples "$MAX_SAMPLES" --epochs "$EPOCHS" \
   --batch_size "$BATCH_SIZE" --max_len "$MAX_LEN" \
   --eval_samples "$EVAL_SAMPLES" --eval_every "$EVAL_EVERY" \
-  --warmup_steps 100 --grad_checkpoint 1 --attn_impl "$ATTN_IMPL" \
+  --eval_max_samples "$EVAL_MAX_SAMPLES" --warmup_steps "$WARMUP_STEPS" \
+  --grad_checkpoint 1 --attn_impl "$ATTN_IMPL" \
   --lora_r 64 --lora_alpha 128 --lora_dropout 0.05 --seed "$SEED" \
   --out "$LARGE_OUT" --plot "$OUT_ROOT/large_lora_r64_seed${SEED}.png"
 

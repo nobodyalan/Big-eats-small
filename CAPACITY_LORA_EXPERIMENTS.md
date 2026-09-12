@@ -34,10 +34,11 @@ STAGE=selection SELECTION_GPU=0 bash scripts/run_two_gpu_pipeline.sh
 STAGE=experiments EXPERIMENT_GPU=1 PREPARE_DATA=0 bash scripts/run_two_gpu_pipeline.sh
 ```
 
-第二阶段自动采用筛选 JSON 中排名第一的位置。训练数据默认约为 75% MATH、
-25% GSM8K，MATH Level 1–5 全部覆盖；训练/验证只来自官方 train，避免测试泄漏。
-服务器正式默认值按 80GB GPU 设置为 batch size 8、训练长度 1024、生成长度 1024、
-3 epochs、FlashAttention 2 和 seed 42。
+第二阶段自动采用筛选 JSON 中排名第一的位置。训练数据默认约 3.2 万条：约 2.4 万
+MATH（官方 train + MetaMathQA-MATH）和 8000 GSM8K；官方 MATH train 的 Level 1–5
+全部覆盖，并保留分层验证集。构造时会去重并封锁官方 MATH test 的精确题面。
+服务器正式默认值按 80GB GPU 设置为 batch size 8、训练长度 1536、生成长度 1024、
+3 epochs、warmup 400 steps、每 500 steps 验证、FlashAttention 2 和 seed 42。
 
 仅运行三组容量实验：
 

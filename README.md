@@ -74,10 +74,13 @@ powershell -ExecutionPolicy Bypass -File scripts/run_local_smoke.ps1
 依赖、显存、保存/重载和参数连接问题，输出准确率不具有统计意义。正式实验仍使用
 `run_capacity_lora_experiments.sh` 中的 bridge 4096 与大模型 LoRA r=64 配置。
 
-两阶段流程会先生成约 75% MATH、25% GSM8K 的训练/验证集；MATH 官方 train
-按 Level 1–5 分层切分，官方 test 只用于最终评测。可分别执行
+两阶段流程会生成约 3.2 万条、75% MATH / 25% GSM8K 的训练集：官方 MATH
+train 按 Level 1–5 分层切分，再加入 MetaMathQA-MATH/GSM8K 增强题；官方 test
+题面会在去重时封锁且只用于最终评测。可分别执行
 `STAGE=selection` 和 `STAGE=experiments`，第二阶段会自动读取第一阶段的最佳位置。
-正式脚本默认按 80GB GPU 使用 batch size 8、max length 1024、3 epochs、
+只有 `data/math_majority_manifest.json` 的配方版本匹配时才自动跳过数据生成；否则从
+服务器已有数据池重建，不会自动下载数据集。
+正式脚本默认按 80GB GPU 使用 batch size 8、max length 1536、3 epochs、
 FlashAttention 2、生成长度 1024 和 seed 42。
 
 任务感知搜索的指标、预算和最终统计规则见
