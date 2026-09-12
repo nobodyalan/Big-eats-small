@@ -100,6 +100,20 @@ def unique_sample(rows, count, rng, blocked):
     return selected, duplicate
 
 
+def deduplicate_all(rows, blocked):
+    """保留全部未见题面；官方数据中的重复项应被记录并跳过，而不是终止。"""
+    selected = []
+    duplicate = 0
+    for row in rows:
+        key = fingerprint(row)
+        if not key or key in blocked:
+            duplicate += 1
+            continue
+        blocked.add(key)
+        selected.append(row)
+    return selected, duplicate
+
+
 def write_jsonl(path, rows):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -149,6 +163,7 @@ def main():
     blocked = set(test_keys)
     official_math_train, official_math_val = [], []
     official_overlap = 0
+    official_internal_duplicates = 0
     for level in range(1, 6):
         pool = []
         for row in official_train[level]:
@@ -156,15 +171,12 @@ def main():
                 official_overlap += 1
             else:
                 pool.append(row)
+        pool, duplicate_count = deduplicate_all(pool, blocked)
+        official_internal_duplicates += duplicate_count
         rng.shuffle(pool)
         n_val = max(1, round(len(pool) * args.math_val_ratio))
         val_rows = pool[:n_val]
         train_rows = pool[n_val:]
-        for row in val_rows + train_rows:
-            key = fingerprint(row)
-            if key in blocked:
-                raise RuntimeError("官方 MATH train 内部出现重复题面")
-            blocked.add(key)
         official_math_val.extend(val_rows)
         official_math_train.extend(train_rows)
 
@@ -207,6 +219,7 @@ def main():
         },
         "official_math_test_fingerprints_blocked": len(test_keys),
         "official_train_test_overlap_skipped": official_overlap,
+        "official_train_internal_duplicates_skipped": official_internal_duplicates,
         "official_test_in_training": False,
     }
     with open(args.manifest, "w", encoding="utf-8") as f:
