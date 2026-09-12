@@ -34,6 +34,7 @@ function Invoke-BesPython {
 Write-Host "[0/8] Environment and regression tests"
 Invoke-BesPython -c "import torch, transformers, peft; print(torch.__version__, transformers.__version__, peft.__version__); print(torch.cuda.get_device_name(0))"
 Invoke-BesPython test\test_position_selection.py -v
+Invoke-BesPython test\test_fusion_runtime.py -v
 
 Write-Host "[1/8] Tiny task-aware position screening"
 Invoke-BesPython core_training\select_positions.py `
@@ -45,21 +46,24 @@ Invoke-BesPython core_training\select_positions.py `
 
 Write-Host "[2/8] Deep bridge, both base models frozen"
 Invoke-BesPython core_training\train_fusion.py `
-    --data data\mix_all.jsonl --max_samples 1 --epochs 1 --batch_size 1 `
+    --data data\mix_all.jsonl --max_samples 2 --epochs 1 --batch_size 1 `
     --max_len $MaxLen --bridge_depth 2 --bridge_mlp_dim $BridgeMlpDim `
     --small_lora_r 0 --grad_checkpoint 1 --attn_impl sdpa --warmup_steps 0 `
     --eval_samples 1 --eval_batch_size 1 --eval_max_samples 1 --eval_every 1 `
-    --contrast_weight 0 --log_every 1 `
+    --branch_warmup_steps 1 --branch_warmup_alpha 0.05 `
+    --guide_weight 0 --guide_every 1 --contrast_weight 0 --log_every 1 `
     --out (Join-Path $OutDir "deep_bridge.pt") --plot ""
 
 Write-Host "[3/8] Small-model segment LoRA plus bridge"
 Invoke-BesPython core_training\train_fusion.py `
-    --data data\mix_all.jsonl --max_samples 1 --epochs 1 --batch_size 1 `
+    --data data\mix_all.jsonl --max_samples 2 --epochs 1 --batch_size 1 `
     --max_len $MaxLen --bridge_depth 1 --bridge_mlp_dim $BridgeMlpDim `
     --small_lora_r $LoraRank --small_lora_alpha (2 * $LoraRank) --small_lora_dropout 0 `
     --grad_checkpoint 1 --attn_impl sdpa --warmup_steps 0 `
     --eval_samples 1 --eval_batch_size 1 --eval_max_samples 1 --eval_every 1 `
-    --contrast_weight 0 --log_every 1 `
+    --small_lora_lr 2e-5 --small_lora_delay_steps 1 `
+    --branch_warmup_steps 1 --branch_warmup_alpha 0.05 `
+    --guide_weight 0 --guide_every 1 --contrast_weight 0 --log_every 1 `
     --out (Join-Path $OutDir "small_lora_bridge.pt") --plot ""
 
 Write-Host "[4/8] True 4B LoRA baseline"

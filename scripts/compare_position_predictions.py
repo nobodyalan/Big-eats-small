@@ -41,12 +41,18 @@ def main():
     ap = argparse.ArgumentParser(description="逐题配对比较两个位置候选")
     ap.add_argument("--a", required=True, help="候选 A 的 eval JSON")
     ap.add_argument("--b", required=True, help="候选 B 的 eval JSON")
-    ap.add_argument("--label", default="fusion", choices=["fusion", "lora", "baseline"])
+    ap.add_argument("--label", default="fusion", choices=["fusion", "lora", "baseline"],
+                    help="两边使用同一结果字段（兼容旧用法）")
+    ap.add_argument("--label_a", choices=["fusion", "lora", "baseline"], default=None)
+    ap.add_argument("--label_b", choices=["fusion", "lora", "baseline"], default=None,
+                    help="允许跨文件比较 fusion/LoRA 与独立 baseline")
     ap.add_argument("--bootstrap", type=int, default=10000)
     ap.add_argument("--seed", type=int, default=2026)
     args = ap.parse_args()
 
-    a, b = load_rows(args.a, args.label), load_rows(args.b, args.label)
+    label_a = args.label_a or args.label
+    label_b = args.label_b or args.label
+    a, b = load_rows(args.a, label_a), load_rows(args.b, label_b)
     keys = sorted(set(a) & set(b))
     if not keys:
         raise SystemExit("两个文件没有可配对的共同题目")
@@ -67,7 +73,8 @@ def main():
     lo, hi = percentile(diffs, 0.025), percentile(diffs, 0.975)
 
     print(f"共同题目: {len(pairs)}")
-    print(f"A={acc_a:.2%} | B={acc_b:.2%} | Δ(B-A)={acc_b - acc_a:+.2%}")
+    print(f"A({label_a})={acc_a:.2%} | B({label_b})={acc_b:.2%} | "
+          f"Δ(B-A)={acc_b - acc_a:+.2%}")
     print(f"配对翻转: A错B对={n01} | A对B错={n10}")
     print(f"paired bootstrap 95% CI: [{lo:+.2%}, {hi:+.2%}]")
     print(f"exact McNemar p={exact_mcnemar_p(n01, n10):.6f}")

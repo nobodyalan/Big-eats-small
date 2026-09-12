@@ -63,7 +63,7 @@ if [[ "$STAGE" == "all" || "$STAGE" == "selection" ]]; then
   CUDA_VISIBLE_DEVICES="$SELECTION_GPU" "$PYTHON" core_training/select_positions.py \
     --data "$DATA" --num_samples 384 --max_len 192 --batch_size 8 \
     --fit_ratio 0.7 --topk 9 --segment_lengths 1,2,4,8,12 \
-    --inject_spans 6,12,18 --exit_topk 18 --exit_samples 128 \
+    --inject_spans 6,12,18 --exit_topk 18 --exit_samples 192 --exit_fit_ratio 0.5 \
     --exit_max_len 128 --intervention_ratios 0.01,0.03,0.10 \
     --rank_ratio 0.03 --out "$SELECTION_OUT"
   "$PYTHON" scripts/summarize_selection.py "$SELECTION_OUT" --topn 18
@@ -87,7 +87,7 @@ fi
 read -r LARGE_START LARGE_END SMALL_START SMALL_END < <(
   "$PYTHON" scripts/best_position.py "$SELECTION_OUT"
 )
-echo "选中位置: large $LARGE_START -> $LARGE_END | small $SMALL_START..$SMALL_END (inclusive)"
+echo "后续实验采用的代表位置: large $LARGE_START -> $LARGE_END | small $SMALL_START..$SMALL_END (inclusive)"
 
 if [[ -f "$DATA_MANIFEST" ]]; then
   MANIFEST_EVAL_SAMPLES=$("$PYTHON" -c \

@@ -200,10 +200,18 @@ def generate(model, tokenizer, prompt: str, max_new: int) -> str:
     tok = tokenizer(text, return_tensors="pt")
     ids = tok.input_ids.to(next(model.parameters()).device)
     amask = tok.attention_mask.to(ids.device)
-    with torch.inference_mode():
-        out = model.generate(ids, attention_mask=amask, max_new_tokens=max_new,
-                             do_sample=False, pad_token_id=tokenizer.eos_token_id,
-                             eos_token_id=tokenizer.eos_token_id)
+    fusion = getattr(model, "_bes_fusion", None)
+    cache_started = fusion is not None and fusion.enabled
+    if cache_started:
+        fusion.begin_generation()
+    try:
+        with torch.inference_mode():
+            out = model.generate(ids, attention_mask=amask, max_new_tokens=max_new,
+                                 do_sample=False, pad_token_id=tokenizer.eos_token_id,
+                                 eos_token_id=tokenizer.eos_token_id)
+    finally:
+        if cache_started:
+            fusion.end_generation()
     return tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
 
 
@@ -291,6 +299,8 @@ def main():
     parser.add_argument("--limit", type=int, default=200, help="每个数据集最多评测多少题(0=全部)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_new", type=int, default=512)
+    parser.add_argument("--attn_impl", default="",
+                        help="4B 注意力实现；正式评测应与训练一致")
     parser.add_argument("--zip", default=ZIP_PATH)
     parser.add_argument("--math_level", type=int, default=0,
                         help="只测 MATH 指定难度(1~5, 0=全部)")
@@ -358,6 +368,7 @@ def main():
     cfg.fusion_bypass_small = args.bypass_small
     dt = resolve_dtype(cfg.dtype)
     large_path = resolve_model_path(cfg.model_large_id, cfg.model_large_local)
+    attn_kwargs = {"attn_implementation": args.attn_impl} if args.attn_impl else {}
 
     # 两个模型可同时挂载(旁路放 fusion 设备, LoRA 放另一张卡), 一次性并行验证两者正确率
     have_fusion = (not args.baseline_only) and (
@@ -379,10 +390,11 @@ def main():
 
     if have_fusion:
         small_path = resolve_model_path(cfg.model_small_id, cfg.model_small_local)
-        tokenizer = AutoTokenizer.from_pretrained(small_path)
+        tokenizer = AutoTokenizer.from_pretrained(large_path)
         fdev = _resolve_dev(args.fusion_device, "cuda:0")
         small = AutoModelForCausalLM.from_pretrained(small_path, dtype=dt).to(fdev).eval()
-        large_f = AutoModelForCausalLM.from_pretrained(large_path, dtype=dt).to(fdev).eval()
+        large_f = AutoModelForCausalLM.from_pretrained(
+            large_path, dtype=dt, **attn_kwargs).to(fdev).eval()
         fusion = attach_fusion(large_f, small, cfg)
         if args.small_lora_ckpt:
             from peft import PeftModel
@@ -392,8 +404,8 @@ def main():
                 small, args.small_lora_ckpt, is_trainable=False).eval()
         if args.ckpt:
             load_fusion(fusion, args.ckpt)
-        gate = float(torch.sigmoid(fusion.gate_logit).detach())
-        print(f"旁路 gate = {gate:.5f} ({'训练后权重' if args.ckpt else '初始恒等'}) "
+        gate = float(fusion.scale().detach())
+        print(f"旁路 scale = {gate:.5f} ({'训练后权重' if args.ckpt else '初始恒等'}) "
               f"(设备 {fdev})")
 
     if have_lora:
@@ -402,7 +414,8 @@ def main():
             tokenizer = AutoTokenizer.from_pretrained(large_path)
         ldev = _resolve_dev(args.lora_device,
                             "cuda:1" if torch.cuda.device_count() >= 2 else "cuda:0")
-        large_l = AutoModelForCausalLM.from_pretrained(large_path, dtype=dt).to(ldev).eval()
+        large_l = AutoModelForCausalLM.from_pretrained(
+            large_path, dtype=dt, **attn_kwargs).to(ldev).eval()
         large_l = PeftModel.from_pretrained(large_l, args.lora_ckpt)
         # 训练存的是 fp32 主权重(配合 autocast bf16 前向); 推理统一回 base 的 dt,
         # 否则 fp32 LoRA + bf16 base 混合 dtype, 且 PEFT 可能把部分 base 参数带到 fp32
@@ -414,7 +427,7 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(large_path)
         bdev = _resolve_dev(args.fusion_device, "cuda:0")
         large_b = AutoModelForCausalLM.from_pretrained(
-            large_path, dtype=dt).to(bdev).eval()
+            large_path, dtype=dt, **attn_kwargs).to(bdev).eval()
         print(f"已加载纯 4B baseline (设备 {bdev}, dtype {dt})")
 
     def set_fusion(on: bool):

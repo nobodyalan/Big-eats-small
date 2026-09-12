@@ -185,30 +185,44 @@ def select_diverse_entries(entries, limit, n_large, n_small):
 
 def build_task_candidates(entry_candidates, top_full, n_large, n_small,
                           lengths, spans, limit):
-    """按片段长度和大模型跨度分层抽取候选；b 始终为 exclusive。"""
-    diag = {(x["L"], x["a"], x["b"]): x for x in top_full}
-    buckets = []
-    for length in lengths:
-        for span in spans:
-            bucket = []
-            for e in entry_candidates:
-                L, a = int(e["L"]), int(e["a"])
-                b = min(n_small, a + length)
-                l2 = min(n_large - 1, L + span)
-                if b <= a or l2 <= L:
-                    continue
-                d = diag.get((L, a, b), {})
-                bucket.append((d.get("e_seg_amp", float("inf")),
-                               (L, l2, a, b)))
-            bucket.sort(key=lambda x: x[0])
-            buckets.append([x[1] for x in bucket])
+    """均衡覆盖入口、片段长度和大模型跨度；b 始终为 exclusive。
 
-    # 轮询各“长度×跨度”桶，防止 limit 被第一个短片段桶占满。
+    旧实现先在每个“长度×跨度”桶内按 E_seg 取最优入口。在候选预算较小
+    时，每个桶往往反复选中同一个浅层入口，名义上的分层最后仍退化成少数
+    L/a 的重复组合。这里用循环错位设计，让第一轮先覆盖不同入口，同时让
+    length/span 随入口轮换；后续轮次再补充同一入口的其他尺度。
+
+    top_full 参数保留用于兼容调用方；E_seg 只作为诊断，不再提前支配任务候选。
+    """
+    del top_full
+    lengths = sorted(set(int(x) for x in lengths if int(x) > 0))
+    spans = sorted(set(int(x) for x in spans if int(x) > 0))
+    configs = []
+    if lengths and spans:
+        # 互质式轮换的前几个配置就能同时覆盖长/短片段和不同注入跨度。
+        total = len(lengths) * len(spans)
+        for i in range(total):
+            cfg = (lengths[i % len(lengths)], spans[i % len(spans)])
+            if cfg not in configs:
+                configs.append(cfg)
+        # 长度数和跨度数不互质时，上面的循环可能未覆盖完整笛卡尔积。
+        for length in lengths:
+            for span in spans:
+                if (length, span) not in configs:
+                    configs.append((length, span))
+
     pool = []
-    for rank in range(max((len(x) for x in buckets), default=0)):
-        for bucket in buckets:
-            if rank < len(bucket):
-                pool.append(bucket[rank])
+    seen = set()
+    for round_idx in range(len(configs)):
+        for entry_idx, e in enumerate(entry_candidates):
+            length, span = configs[(entry_idx + round_idx) % len(configs)]
+            L, a = int(e["L"]), int(e["a"])
+            cand = (L, min(n_large - 1, L + span),
+                    a, min(n_small, a + length))
+            if cand[3] <= cand[2] or cand[1] <= cand[0] or cand in seen:
+                continue
+            seen.add(cand)
+            pool.append(cand)
 
     # 始终保留当前默认 1/3→2/3，避免筛选器把强基线提前丢掉。
     default = (n_large // 3, min(n_large - 1, 2 * n_large // 3),
@@ -294,7 +308,7 @@ def exit_screening(small, large, tokenizer, recs, cands, args, Xf, Yf, dev):
     sample = recs[:args.exit_samples]
     if len(sample) < 2:
         return []
-    n_fit = max(1, min(len(sample) - 1, int(len(sample) * args.fit_ratio)))
+    n_fit = max(1, min(len(sample) - 1, int(len(sample) * args.exit_fit_ratio)))
     fit_recs, val_recs = sample[:n_fit], sample[n_fit:]
 
     def collect(recs_sub):
@@ -393,7 +407,8 @@ def rank_task_aware_results(results):
 def main():
     ap = argparse.ArgumentParser(description="数据驱动选择 bridge 接入位置(Approach B)")
     ap.add_argument("--data", default="data/mix_all.jsonl")
-    ap.add_argument("--num_samples", type=int, default=128, help="校准样本数")
+    ap.add_argument("--num_samples", type=int, default=128,
+                    help="表示映射校准样本数（任务筛选另取 exit_samples 条独立题目）")
     ap.add_argument("--max_len", type=int, default=128)
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--fit_ratio", type=float, default=0.7)
@@ -413,6 +428,8 @@ def main():
                     help="执行任务感知 ΔNLL 筛选的分层候选数")
     ap.add_argument("--exit_samples", type=int, default=64,
                     help="任务感知筛选样本数；从入口映射未见过的题目中抽取")
+    ap.add_argument("--exit_fit_ratio", type=float, default=0.5,
+                    help="任务 probe 拟合比例；其余样本用于候选间配对比较")
     ap.add_argument("--exit_max_len", type=int, default=96)
     ap.add_argument("--exit_lam", type=float, default=0.1,
                     help="输出 bridge 的 ridge(相对 gram 尺度)")
@@ -429,7 +446,8 @@ def main():
 
     small_path = resolve_model_path(cfg.model_small_id, cfg.model_small_local)
     large_path = resolve_model_path(cfg.model_large_id, cfg.model_large_local)
-    tokenizer = AutoTokenizer.from_pretrained(small_path)
+    # 任务训练与最终解码都由 4B Instruct 定义格式，筛选必须使用同一 chat template。
+    tokenizer = AutoTokenizer.from_pretrained(large_path)
     small = AutoModelForCausalLM.from_pretrained(small_path, dtype=dt).cuda().eval()
     large = AutoModelForCausalLM.from_pretrained(large_path, dtype=dt).cuda().eval()
     for m in (small, large):
@@ -441,11 +459,18 @@ def main():
     print(f"4B: {n_large} 层 | 0.6B: {n_small} 层")
 
     # ── 采样校准文本 ──
-    recs = load_records(args.data, 0)
-    if not recs:
+    all_recs = load_records(args.data, 0)
+    if not all_recs:
         raise SystemExit(f"[错误] 无数据: {args.data}")
-    random.Random(cfg.seed).shuffle(recs)
-    recs = recs[:args.num_samples]
+    random.Random(cfg.seed).shuffle(all_recs)
+    # num_samples 与 exit_samples 是两个互斥数据池，避免增大任务样本数时反而
+    # 挤占表示拟合样本；数据不足时优先保留至少两个表示样本和两个任务样本。
+    n_task = min(args.exit_samples, max(0, len(all_recs) - 2))
+    n_repr = min(args.num_samples, len(all_recs) - n_task)
+    if n_repr < 2 or n_task < 2:
+        raise SystemExit("[错误] 数据太少，表示校准和任务筛选都至少需要 2 条")
+    repr_recs = all_recs[:n_repr]
+    task_recs = all_recs[n_repr:n_repr + n_task]
     def calibration_text(r):
         prompt, response = r.get("prompt", ""), r.get("response", "")
         if getattr(tokenizer, "chat_template", None):
@@ -454,15 +479,11 @@ def main():
                 add_generation_prompt=True)
         return (prompt + response)[:2000]
 
-    texts = [calibration_text(r) for r in recs]
+    texts = [calibration_text(r) for r in repr_recs]
     # 三路按题目切分：表示映射 fit / 表示诊断 val / 最终 task screen。
-    # task screen 不参与 E_in/E_seg 候选构造，避免用同一批题筛选又评分。
-    n_task = min(args.exit_samples, max(2, len(texts) // 3))
-    n_repr = len(texts) - n_task
-    if n_repr < 2:
-        raise SystemExit("[错误] 校准样本太少，至少需要 4 条")
+    # task screen 使用 task_recs，不参与 E_in/E_seg 候选构造。
     n_fit = max(1, min(n_repr - 1, int(n_repr * args.fit_ratio)))
-    print(f"校准样本 {len(texts)} (repr fit {n_fit} / repr val {n_repr - n_fit} "
+    print(f"校准样本 {n_repr + n_task} (repr fit {n_fit} / repr val {n_repr - n_fit} "
           f"/ task {n_task})")
 
     dev = model_device(large)
@@ -591,7 +612,6 @@ def main():
     cands = build_task_candidates(entry_candidates, top_full, n_large, n_small,
                                   lengths, spans, args.exit_topk)
     if cands:
-        task_recs = recs[n_repr:]
         print(f"\n===== 任务感知筛选(分层 {len(cands)} 候选, 独立样本最多 {args.exit_samples}) =====")
         exit_results = exit_screening(small, large, tokenizer, task_recs,
                                       cands, args, Xf, Yf, dev)

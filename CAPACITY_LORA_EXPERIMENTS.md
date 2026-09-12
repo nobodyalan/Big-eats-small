@@ -3,6 +3,8 @@
 ## 参数量设计
 
 三组实验不做强制等参数，只保持数据、训练 token、优化器和评测设置一致。
+正式归因时应加 `RUN_CONTROLS=1`，额外训练冻结小模型标准 bridge，以及 depth1/depth2
+同容量 bridge-only 对照；默认关闭是为了避免常规三组流程的训练时长翻倍。
 
 | 实验 | 可训练部分 | 默认配置 | 预计可训练参数 |
 | --- | --- | --- | ---: |
@@ -39,6 +41,12 @@ MATH（官方 train + MetaMathQA-MATH）和 8000 GSM8K；官方 MATH train 的 L
 全部覆盖，并保留分层验证集。构造时会去重并封锁官方 MATH test 的精确题面。
 服务器正式默认值按 80GB GPU 设置为 batch size 8、训练长度 1536、生成长度 1024、
 3 epochs、warmup 400 steps、每 500 steps 验证、FlashAttention 2 和 seed 42。
+旁路优化使用普通 response-only CE，并另设 400-step 固定 `branch_alpha=0.05` 的启动阶段，随后释放 alpha；前
+200 step 只训练 bridge，之后才解冻小模型 LoRA。bridge、小模型 LoRA、alpha 的
+学习率分别为 `1e-4 / 2e-5 / 5e-4`。baseline 重加权和旧 JS 都默认关闭；zero 与
+shuffled 只在验证时作为反事实诊断，不参与反向传播。小模型 LoRA dropout 在该实验
+中设为 0，避免 correct/shuffled 对照混入不同 dropout 掩码造成的随机差异；大模型
+LoRA baseline 仍保留 0.05 dropout。
 
 仅运行三组容量实验：
 

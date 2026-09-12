@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.join(_ROOT, "core_training"))
 
 from main import Config, resolve_dtype, resolve_model_path, model_device
 from train_fusion import (load_records, TextDataset, collate,
-                          causal_lm_loss, plot_losses)
+                          causal_lm_loss, causal_lm_loss_parts, plot_losses)
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -158,21 +158,25 @@ def main():
         """LoRA 开 vs 关(即微调后 vs 原 4B)在验证集答案段上的 CE"""
         model.eval()
         lora_sum = base_sum = 0.0
-        n = 0
+        lora_weight = base_weight = 0.0
         seen = 0
         for ids, mask, labels, weights in eval_loader:
             ids, mask, labels = ids.to(dev), mask.to(dev), labels.to(dev)
             weights = weights.to(dev)
             model.enable_adapter_layers()
-            lora_sum += causal_lm_loss(forward_logits(ids, mask), labels, weights).item()
+            ls, lw = causal_lm_loss_parts(forward_logits(ids, mask), labels, weights)
+            lora_sum += ls.item()
+            lora_weight += lw.item()
             model.disable_adapter_layers()
-            base_sum += causal_lm_loss(forward_logits(ids, mask), labels, weights).item()
+            bs, bw = causal_lm_loss_parts(forward_logits(ids, mask), labels, weights)
+            base_sum += bs.item()
+            base_weight += bw.item()
             model.enable_adapter_layers()
-            n += 1
             seen += ids.size(0)
             if args.eval_max_samples > 0 and seen >= args.eval_max_samples:
                 break
-        return lora_sum / n, base_sum / n
+        return (lora_sum / max(lora_weight, 1.0),
+                base_sum / max(base_weight, 1.0))
 
     # ── 训练循环 ──
     os.makedirs(os.path.dirname(out_dir) or ".", exist_ok=True)

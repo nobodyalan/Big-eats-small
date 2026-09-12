@@ -2,8 +2,8 @@
 """
 门控残差融合适配器训练脚本
 ==========================
-冻结 4B(主脑)与 0.6B(旁路中段宿主),只训练门控残差旁路的可训练参数:
-  adapter1 / adapter2 / gate_logit(共约 22M)。
+冻结 4B(主脑)与 0.6B(旁路中段宿主),训练门控残差旁路；可选地只对
+实际使用的小模型层挂 LoRA。bridge、small LoRA 与 branch alpha 使用解耦学习率。
 
 训练目标: 因果语言建模(下一 token 预测)损失。
 梯度路径: loss → 4B 第 24 层注入点 → adapter2 → 0.6B 中段层 → adapter1。
@@ -24,6 +24,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 import time
 from contextlib import nullcontext
@@ -95,6 +96,14 @@ class TextDataset(Dataset):
         return self.texts[i]
 
 
+def answer_start_char(response: str) -> int:
+    """返回最靠后的标准答案标记位置；不存在则为 -1。"""
+    positions = [response.rfind(marker) for marker in ("\\boxed", "####")]
+    positions.extend(m.start() for m in re.finditer(
+        r"(?:the\s+)?answer\s+is\s*:", response, flags=re.IGNORECASE))
+    return max(positions, default=-1)
+
+
 def collate(batch, tokenizer, max_len: int, answer_weight: float = 1.0):
     """SFT 式编码: 只对 response 算 loss(prompt 位置 label=IGNORE),
     并给最终答案段(\\boxed / #### 之后)加权。返回 (input_ids, attention_mask, labels, weights)。"""
@@ -124,13 +133,9 @@ def collate(batch, tokenizer, max_len: int, answer_weight: float = 1.0):
             r_off = r_off + [(0, 0)]
         r_ids = r_ids[:max_len - len(p_ids)]
         r_off = r_off[:len(r_ids)]
-        # 定位答案段起点(最后一个 \boxed 或 ####), 之后加权
-        ans_char = -1
-        for marker in ("\\boxed", "####"):
-            i = resp.rfind(marker)
-            if i != -1:
-                ans_char = i
-                break
+        # 定位最终答案段起点。MetaMathQA 常用 "The answer is:"，且同一回答
+        # 可能同时含 boxed/####；必须取所有标记中最靠后的一个，不能按标记类型提前 break。
+        ans_char = answer_start_char(resp)
         ans_tok = None
         if ans_char != -1:
             for k, (s, e) in enumerate(r_off):
@@ -164,17 +169,150 @@ def causal_lm_loss(logits, labels, weights=None):
     weights 非空时对每个有效位置按权重加权(答案段加权用)。"""
     # 保持 bf16 传给 F.cross_entropy(内部按 fp32 算 log_softmax), 省掉整张 fp32 logits 拷贝
     # (batch×seq×151936 词表的 fp32 拷贝 ≈5GB, 是 4B 训练 OOM 的直接触发点)
+    loss_sum, weight_sum = causal_lm_loss_parts(logits, labels, weights)
+    return loss_sum / weight_sum.clamp(min=1)
+
+
+def causal_lm_loss_parts(logits, labels, weights=None):
+    """返回有效 token 的加权 CE 总和与权重总和，供跨 batch 无偏聚合。"""
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = labels[:, 1:].contiguous()
-    if weights is None:
-        return F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)),
-                               shift_labels.view(-1), ignore_index=IGNORE)
     ce = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)),
                          shift_labels.view(-1), ignore_index=IGNORE, reduction="none")
     ce = ce.view(shift_labels.shape)
-    w = weights[:, 1:].to(ce.device).float()
     mask = (shift_labels != IGNORE).float()
-    return (ce * w * mask).sum() / (w * mask).sum().clamp(min=1)
+    if weights is None:
+        w = mask
+    else:
+        w = weights[:, 1:].to(ce.device).float() * mask
+    return (ce * w).sum(), w.sum()
+
+
+def causal_lm_loss_per_example(logits, labels, weights=None):
+    """返回每条样本的加权 token 平均 CE，供配对引导损失使用。"""
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+    ce = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)),
+                         shift_labels.view(-1), ignore_index=IGNORE, reduction="none")
+    ce = ce.view(shift_labels.shape)
+    mask = (shift_labels != IGNORE).float()
+    if weights is None:
+        w = mask
+    else:
+        w = weights[:, 1:].to(ce.device).float() * mask
+    return (ce * w).sum(dim=1) / w.sum(dim=1).clamp_min(1.0)
+
+
+def baseline_improvement_loss(correct_logits, zero_losses,
+                              labels, weights=None, margin=0.02):
+    """逐样本要求融合 CE 至少比冻结 4B baseline 低 margin。
+
+    reference 被 detach，因此这是由真实标签监督的、baseline 感知的难例加权；
+    它不会把错配分支推向任意坏分布，也不冒充对比学习。
+    """
+    correct = causal_lm_loss_per_example(correct_logits, labels, weights)
+    per_example = F.relu(margin + correct - zero_losses.detach())
+    active_ratio = (per_example > 0).float().mean()
+    return per_example.mean(), active_ratio
+
+
+def diagnose_train_branch(branch_ratio, branch_scale, bridge_grad,
+                          alpha_grad=0.0, lora_grad=0.0,
+                          alpha_trainable=True, lora_trainable=False,
+                          min_ratio=1e-4, max_ratio=0.5,
+                          grad_epsilon=1e-10):
+    """返回分支数值/梯度健康告警，不改变训练过程。
+
+    这里只能判断旁路是否“活着”；是否携带样本相关的有效信息，必须由验证集上的
+    correct/zero/shuffled 对照判断。
+    """
+    values = {
+        "branch/base RMS": float(branch_ratio),
+        "branch_scale": float(branch_scale),
+        "bridge_grad": float(bridge_grad),
+        "alpha_grad": float(alpha_grad),
+        "lora_grad": float(lora_grad),
+    }
+    nonfinite = [name for name, value in values.items() if not math.isfinite(value)]
+    if nonfinite:
+        return ["非有限数值: " + ",".join(nonfinite)]
+
+    warnings = []
+    if values["branch/base RMS"] < min_ratio:
+        warnings.append(
+            f"旁路幅度过低({values['branch/base RMS']:.2e} < {min_ratio:.2e})")
+    elif values["branch/base RMS"] > max_ratio:
+        warnings.append(
+            f"旁路幅度过高({values['branch/base RMS']:.2e} > {max_ratio:.2e})")
+    if values["bridge_grad"] <= grad_epsilon:
+        warnings.append("bridge 梯度近零")
+    if alpha_trainable:
+        if abs(values["branch_scale"]) < min_ratio:
+            warnings.append("alpha 接近零，疑似关闭旁路")
+        if values["alpha_grad"] <= grad_epsilon:
+            warnings.append("alpha 梯度近零")
+    if lora_trainable and values["lora_grad"] <= grad_epsilon:
+        warnings.append("small LoRA 梯度近零")
+    return warnings
+
+
+def classify_branch_evaluation(fusion_loss, baseline_loss, shuffled_loss,
+                               tolerance=1e-4):
+    """分类验证集上是否存在有效、样本相关的旁路使用证据。"""
+    values = [float(fusion_loss), float(baseline_loss), float(shuffled_loss)]
+    if not all(math.isfinite(value) for value in values):
+        return "NONFINITE", "评估损失出现非有限值"
+    gain = baseline_loss - fusion_loss
+    specificity = shuffled_loss - fusion_loss
+    if gain > tolerance and specificity > tolerance:
+        return "USEFUL", "正确旁路同时优于关闭与 shuffled"
+    if gain < -tolerance:
+        return "HARMFUL", "正确旁路劣于冻结 4B baseline"
+    if specificity < -tolerance:
+        return "SHUFFLED_BETTER", "shuffled 优于正确旁路，尚无内容特异性"
+    if abs(gain) <= tolerance and abs(specificity) <= tolerance:
+        return "DROPPED", "correct/zero/shuffled 几乎相同，疑似旁路被忽略"
+    if gain > tolerance and specificity <= tolerance:
+        return "GENERIC", "优于关闭但不优于 shuffled，可能只是通用扰动/容量收益"
+    return "INCONCLUSIVE", "差异尚未超过容差，继续观察"
+
+
+def mismatched_hidden(hidden, attention_mask=None):
+    """构造长度感知的错配旁路，仅用于反事实诊断/可选旧 JS。
+
+    batch>1 时按长度排序后选择无自配对，并把来源的有效 token 等比例重采样到
+    目标有效长度，避免来源 padding 落入目标有效区。batch=1 只能退化为有效区
+    内 token 滚动，因此正式 shuffled 诊断应使用 batch>1。
+    """
+    hidden = hidden.detach()
+    if attention_mask is None:
+        attention_mask = torch.ones(hidden.shape[:2], device=hidden.device, dtype=torch.long)
+    else:
+        attention_mask = attention_mask.to(hidden.device)
+    lengths = attention_mask.long().sum(dim=1).clamp_min(1)
+    if hidden.size(0) > 1:
+        order = torch.argsort(lengths)
+        # 两个方向都无自配对，选择总长度差更小的循环方向。
+        prev = torch.roll(order, shifts=1)
+        nxt = torch.roll(order, shifts=-1)
+        prev_cost = (lengths[order] - lengths[prev]).abs().sum()
+        nxt_cost = (lengths[order] - lengths[nxt]).abs().sum()
+        sources_sorted = prev if prev_cost <= nxt_cost else nxt
+        source_for = torch.empty_like(order)
+        source_for[order] = sources_sorted
+        wrong = torch.zeros_like(hidden)
+        for target in range(hidden.size(0)):
+            source = int(source_for[target])
+            nt, ns = int(lengths[target]), int(lengths[source])
+            # 用离散等比例索引填满目标有效区，不复制来源 padding。
+            idx = torch.div(torch.arange(nt, device=hidden.device) * ns,
+                            nt, rounding_mode="floor").clamp_max(ns - 1)
+            wrong[target, :nt] = hidden[source, idx]
+        return wrong
+    n = int(lengths[0])
+    wrong = torch.zeros_like(hidden)
+    wrong[0, :n] = torch.roll(hidden[0, :n], shifts=1, dims=0) if n > 1 else -hidden[0, :n]
+    return wrong
 
 
 def attach_small_lora(model, s1, s2, rank, alpha, dropout, targets, resume=""):
@@ -228,7 +366,7 @@ def js_contrastive(logits_n, logits_r, labels, margin=JS_MARGIN):
 
 
 def plot_losses(train_ce_history, eval_history, path):
-    """画训练 CE + 评估 fusion/baseline 两张子图并保存 PNG"""
+    """画训练 CE + 评估 correct/zero/shuffled 三路 loss。"""
     if not path:
         return
     try:
@@ -253,12 +391,19 @@ def plot_losses(train_ce_history, eval_history, path):
         axes[0].set_ylabel("CE")
         axes[0].legend()
     if eval_history:
-        steps = [s for s, _, _ in eval_history]
-        f = [x for _, x, _ in eval_history]
-        b = [x for _, _, x in eval_history]
+        steps = [row[0] for row in eval_history]
+        f = [row[1] for row in eval_history]
+        b = [row[2] for row in eval_history]
         axes[1].plot(steps, b, marker="o", ms=3, label="baseline (branch off)")
-        axes[1].plot(steps, f, marker="o", ms=3, label="fusion (branch on)")
-        axes[1].set_title("Eval: fusion vs baseline")
+        if all(len(row) >= 4 for row in eval_history):
+            shuffled = [row[3] for row in eval_history]
+            axes[1].plot(steps, shuffled, marker="o", ms=3, label="shuffled branch")
+            axes[1].plot(steps, f, marker="o", ms=3, label="fusion (branch on)")
+            axes[1].set_title("Eval: correct vs zero vs shuffled")
+        else:
+            # train_lora.py 使用 (step, adapted, baseline) 三元组。
+            axes[1].plot(steps, f, marker="o", ms=3, label="adapted model")
+            axes[1].set_title("Eval: adapted model vs baseline")
         axes[1].set_xlabel("step")
         axes[1].set_ylabel("CE")
         axes[1].legend()
@@ -277,12 +422,35 @@ def main():
     parser.add_argument("--max_samples", type=int, default=0, help="最多训练条数(0=全部; 评估集另算, 不被截断)")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--max_len", type=int, default=1024, help="单条最大 token 数(显存不足先调小)")
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-4,
+                        help="兼容参数；--bridge_lr 未设置时作为 bridge 学习率")
+    parser.add_argument("--bridge_lr", type=float, default=None,
+                        help="随机初始化 bridge 学习率；默认沿用 --lr (1e-4)")
+    parser.add_argument("--small_lora_lr", type=float, default=2e-5,
+                        help="小模型 LoRA 学习率；预训练参数增量应低于 bridge")
+    parser.add_argument("--small_lora_delay_steps", type=int, default=200,
+                        help="前 N 步只训练 bridge，之后才解冻小模型 LoRA；resume 自动跳过")
+    parser.add_argument("--alpha_lr", type=float, default=5e-4,
+                        help="branch_alpha 独立学习率；不使用 weight decay")
+    parser.add_argument("--weight_decay", type=float, default=0.01,
+                        help="bridge AdamW weight decay；LoRA/alpha 默认不衰减")
     parser.add_argument("--warmup_steps", type=int, default=300,
                         help="学习率线性 warmup 步数(0=关闭; 之后余弦衰减到 10%%)")
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--gate_init", type=float, default=0.0,
-                        help="训练起始 gate_logit(0→sigmoid=0.5);-10 会以 4.5e-5 阻塞梯度")
+    parser.add_argument("--small_lora_grad_clip", type=float, default=0.5,
+                        help="小模型 LoRA 独立梯度裁剪；不受大 bridge 梯度范数牵连")
+    parser.add_argument("--alpha_grad_clip", type=float, default=0.1,
+                        help="标量 branch alpha 的独立梯度裁剪")
+    parser.add_argument("--gate_init", type=float, default=None,
+                        help="已弃用的旧 sigmoid gate 参数；新版训练忽略它以兼容旧运行脚本")
+    parser.add_argument("--branch_alpha_init", type=float, default=0.0,
+                        help="关闭 branch warmup 时的 ReZero 初值；默认 0")
+    parser.add_argument("--branch_warmup_steps", type=int, default=400,
+                        help="前 N 步固定非零 alpha 训练 bridge/LoRA；resume 时自动跳过")
+    parser.add_argument("--branch_warmup_alpha", type=float, default=0.05,
+                        help="branch warmup 阶段固定的残差系数")
+    parser.add_argument("--branch_alpha_max", type=float, default=0.25,
+                        help="释放后将 ReZero alpha 限制在 ±该值；0=不限制")
     parser.add_argument("--bridge_depth", type=int, default=1,
                         help="每个输入/输出 adapter 的深度；2≈88M bridge 参数")
     parser.add_argument("--bridge_mlp_dim", type=int, default=None,
@@ -307,8 +475,14 @@ def main():
                         help="继续训练已保存的小模型 LoRA 目录")
     parser.add_argument("--grad_checkpoint", type=int, default=0, help="1=梯度检查点(省显存但更慢)")
     parser.add_argument("--batch_size", type=int, default=8, help="训练 batch(H100 可用 8~16)")
-    parser.add_argument("--contrast_weight", type=float, default=0.5,
-                        help="InterLat 式 JS 对比损失权重(0=关闭;>0 时防止旁路被无视/门控塌缩)")
+    parser.add_argument("--contrast_weight", type=float, default=0.0,
+                        help="旧 JS 敏感性正则权重；不保证任务增益，正式实验建议 0")
+    parser.add_argument("--guide_weight", type=float, default=0.0,
+                        help="实验性 baseline 感知重加权；默认 0，正式训练仅用普通 CE")
+    parser.add_argument("--guide_margin", type=float, default=0.02,
+                        help="任务引导所需的每 token CE 优势(nats)")
+    parser.add_argument("--guide_every", type=int, default=4,
+                        help="每 N 个训练 step 计算一次引导，控制额外前向开销")
     parser.add_argument("--answer_weight", type=float, default=1.0,
                         help="最终答案段(\\boxed/#### 之后)的 loss 权重(SFT 答案加权)")
     parser.add_argument("--seed", type=int, default=None,
@@ -319,6 +493,14 @@ def main():
     parser.add_argument("--eval_max_samples", type=int, default=400,
                         help="每次评估最多用多少条(0=全部; 验证集大时应设小, 否则每步评估很慢)")
     parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument("--branch_min_rms_ratio", type=float, default=1e-4,
+                        help="训练诊断：低于此 branch/base RMS 时提示旁路过弱")
+    parser.add_argument("--branch_max_rms_ratio", type=float, default=0.5,
+                        help="训练诊断：高于此 branch/base RMS 时提示旁路过强")
+    parser.add_argument("--branch_loss_tolerance", type=float, default=1e-4,
+                        help="验证诊断：correct/zero/shuffled CE 的无差异容差")
+    parser.add_argument("--branch_health_patience", type=int, default=3,
+                        help="连续多少次验证无 USEFUL 证据后打印显著告警；0=关闭")
     parser.add_argument("--out", default=None,
                         help="最终权重路径(默认=自动 cache/fusion_s<起>_<止>_<时间戳>.pt)")
     parser.add_argument("--resume", default="", help="从已保存的旁路参数继续")
@@ -329,6 +511,21 @@ def main():
     parser.add_argument("--attn_impl", default="",
                         help="注意力实现(sdpa/flash_attention_2/eager; 空=自动)。旁路训练建议保持 sdpa")
     args = parser.parse_args()
+    if args.branch_warmup_steps < 0:
+        parser.error("--branch_warmup_steps 必须 >= 0")
+    if args.small_lora_delay_steps < 0:
+        parser.error("--small_lora_delay_steps 必须 >= 0")
+    if args.guide_every < 1:
+        parser.error("--guide_every 必须 >= 1")
+    if args.branch_min_rms_ratio < 0 or args.branch_max_rms_ratio <= 0:
+        parser.error("分支 RMS 阈值必须满足 min >= 0 且 max > 0")
+    if args.branch_min_rms_ratio >= args.branch_max_rms_ratio:
+        parser.error("--branch_min_rms_ratio 必须小于 --branch_max_rms_ratio")
+    if args.branch_loss_tolerance < 0 or args.branch_health_patience < 0:
+        parser.error("分支 loss 容差和 patience 必须 >= 0")
+    if args.gate_init is not None:
+        print(f"    [兼容] --gate_init {args.gate_init:g} 属于旧 sigmoid gate，"
+              "新版 ReZero 训练忽略该值；请改用 --branch_alpha_init")
 
     cfg = Config()
     if args.seed is not None:
@@ -354,7 +551,8 @@ def main():
     # ── 加载模型(全在 GPU,bf16;不用 device_map='auto' 的 offload) ──
     small_path = resolve_model_path(cfg.model_small_id, cfg.model_small_local)
     large_path = resolve_model_path(cfg.model_large_id, cfg.model_large_local)
-    tokenizer = AutoTokenizer.from_pretrained(small_path)
+    # 以最终解码器 4B Instruct 的 chat template 为唯一训练格式。
+    tokenizer = AutoTokenizer.from_pretrained(large_path)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -381,6 +579,9 @@ def main():
     small.eval()
     if args.grad_checkpoint:
         large.gradient_checkpointing_enable()
+        # 冻结主模型时仍需让隐藏状态保留梯度，确保外接 hook 中的 bridge 可回传；
+        # Transformers 5.x 会自动设置，但显式调用可兼容较旧服务器版本。
+        large.enable_input_require_grads()
         print("    梯度检查点已开启")
 
     # ── 挂载门控残差旁路 ──
@@ -407,36 +608,75 @@ def main():
     if args.resume:
         load_fusion(fusion, args.resume)
     else:
-        # 关键: attach_fusion 里 gate_logit=-10(sigmoid≈4.5e-5)是为了推理时的
-        # "初始恒等"。但训练时 branch = gate · adapter2(...),-10 会把所有适配器
-        # 梯度整体缩小 4.5e-5 倍 → 训练卡死。这里把 gate 重置到可训练值;
-        # adapter2 仍零初始化, 所以 step 0 时 branch 依然是 0, 恒等保持不破坏。
-        with torch.no_grad():
-            fusion.gate_logit.fill_(args.gate_init)
-        # 关键修复2: 零初始化 up 投影把梯度链锁死——只有 adapter2.up 自己有梯度,
-        # 其余所有参数(adapter1.*、adapter2.down/gate、两个 norm、gate_logit)的梯度
-        # 都要穿过 adapter2.up 这个零点, 一开始全为 0, 只能等 adapter2.up 慢慢长起来
-        # 才"解冻", adapter1 因此几乎学不动。训练时不需要恒等, 直接把两个 up 投影
-        # 重初始化为小随机值, 让整条旁路第 0 步就有梯度; 输出尺度由 output_norm /
-        # 0.6B 的 input_layernorm 归一化兜底, 不会爆炸。
-        # 包括 adapter 的首层 up 以及加深 bridge 后的所有残差 block up。
+        # 固定小非零 alpha 的 branch warmup 让 bridge 从第一步就获得梯度；
+        # 小模型 LoRA 可延迟解冻，避免它替尚未成形的 bridge 补偿。
+        # 若显式关闭 branch warmup，则仍可用纯 ReZero alpha=0 初始化。
         for m in fusion.modules():
             if hasattr(m, "up") and isinstance(m.up, torch.nn.Linear):
                 torch.nn.init.normal_(m.up.weight, std=0.02)
                 torch.nn.init.zeros_(m.up.bias)
-    bridge_params = [p for p in fusion.parameters() if p.requires_grad]
+        with torch.no_grad():
+            initial_alpha = (args.branch_warmup_alpha if args.branch_warmup_steps > 0
+                             else args.branch_alpha_init)
+            fusion.branch_alpha.fill_(initial_alpha)
+
+    # 随机初始化映射层、预训练小模型 LoRA 和标量 alpha 的优化尺度不同，不能共用
+    # 一个 lr。alpha 不做 weight decay；LoRA 默认也不衰减，避免低秩更新被过早压小。
+    scale_param = (fusion.gate_logit if fusion.gate_mode == "sigmoid"
+                   else fusion.branch_alpha)
+    bridge_params = [p for name, p in fusion.named_parameters()
+                     if p.requires_grad and name not in {"branch_alpha", "gate_logit"}]
     small_lora_params = ([p for p in small_lora_model.parameters() if p.requires_grad]
                          if small_lora_model is not None else [])
     for p in small_lora_params:
         p.data = p.data.float()
-    params = bridge_params + small_lora_params
+    use_lora_delay = (bool(small_lora_params) and not args.resume
+                      and args.small_lora_delay_steps > 0)
+    if use_lora_delay:
+        for p in small_lora_params:
+            p.requires_grad_(False)
+    use_branch_warmup = (not args.resume and fusion.gate_mode == "rezero"
+                         and args.branch_warmup_steps > 0)
+    if use_branch_warmup:
+        scale_param.requires_grad_(False)
+    scale_params = [scale_param]
+    params = bridge_params + small_lora_params + scale_params
     n_bridge = sum(p.numel() for p in bridge_params)
     n_small_lora = sum(p.numel() for p in small_lora_params)
     print(f"可训练参数: bridge {n_bridge / 1e6:.2f}M | "
           f"small LoRA {n_small_lora / 1e6:.2f}M | "
           f"总计 {(n_bridge + n_small_lora) / 1e6:.2f}M")
 
-    opt = torch.optim.AdamW(params, lr=args.lr)
+    bridge_lr = args.bridge_lr if args.bridge_lr is not None else args.lr
+    param_groups = [{"params": bridge_params, "lr": bridge_lr,
+                     "weight_decay": args.weight_decay, "name": "bridge"}]
+    if small_lora_params:
+        param_groups.append({"params": small_lora_params, "lr": args.small_lora_lr,
+                             "weight_decay": 0.0, "name": "small_lora"})
+    param_groups.append({"params": scale_params, "lr": args.alpha_lr,
+                         "weight_decay": 0.0, "name": "branch_alpha"})
+    opt = torch.optim.AdamW(param_groups)
+    print("优化器参数组: " + " | ".join(
+        f"{g['name']} lr={g['lr']:.2e} wd={g['weight_decay']:g}"
+        for g in param_groups))
+    if use_branch_warmup:
+        print(f"旁路 warmup: 前 {args.branch_warmup_steps} step 固定 "
+              f"branch_alpha={args.branch_warmup_alpha:g}，随后释放 alpha")
+    elif args.resume and args.branch_warmup_steps > 0:
+        print("旁路 warmup: 检测到 --resume，保留检查点 scale 并直接联合优化")
+    print("训练目标: response-only causal CE", end="")
+    if args.guide_weight > 0:
+        print(f" + 实验性 baseline 重加权(weight={args.guide_weight:g}, "
+              f"margin={args.guide_margin:g}, every={args.guide_every})", end="")
+    if args.contrast_weight > 0:
+        print(f" + 旧 JS(weight={args.contrast_weight:g})", end="")
+    print("；zero/shuffled 默认仅用于验证诊断")
+    print(f"分支健康阈值: RMS ratio [{args.branch_min_rms_ratio:g}, "
+          f"{args.branch_max_rms_ratio:g}] | loss tolerance "
+          f"{args.branch_loss_tolerance:g} | 连续告警 {args.branch_health_patience} 次")
+    if use_lora_delay:
+        print(f"小模型 LoRA: 前 {args.small_lora_delay_steps} step 冻结，"
+              "先让 bridge 对齐固定表征，随后解冻")
     dev = model_device(large)
 
     # ── 数据: 切出评估集(不参与训练, 用来对比 baseline/fusion loss) ──
@@ -464,7 +704,9 @@ def main():
         total_steps = len(loader) * args.epochs
         def lr_lambda(step):
             if step < args.warmup_steps:
-                return step / max(1, args.warmup_steps)
+                # LambdaLR 在优化器第一次 step 前会先调用 step=0；使用 step+1，
+                # 避免第一个 bridge warmup 更新的学习率恰好为 0。
+                return (step + 1) / max(1, args.warmup_steps)
             p = (step - args.warmup_steps) / max(1, total_steps - args.warmup_steps)
             p = min(1.0, max(0.0, p))
             return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * p))
@@ -483,38 +725,51 @@ def main():
 
     @torch.no_grad()
     def evaluate():
-        """在评估集上算 (fusion_loss, baseline_loss) 均值;baseline 关掉旁路"""
+        """评估正确旁路、关闭旁路、错配旁路的 token 加权 CE。"""
         large.eval()          # 关梯度检查点(只在 train 模式生效),no_grad 下干净前向
         if small_lora_model is not None:
             small_lora_model.eval()
-        f_sum = b_sum = 0.0
-        n = 0
+        f_sum = b_sum = s_sum = 0.0
+        f_weight = b_weight = s_weight = 0.0
         seen = 0
         for ids, mask, labels, weights in eval_loader:
             ids, mask, labels = ids.to(dev), mask.to(dev), labels.to(dev)
             weights = weights.to(dev)
-            fusion.enabled = True
-            f_sum += causal_lm_loss(forward_logits(ids, mask), labels, weights).item()
             fusion.enabled = False
-            b_sum += causal_lm_loss(forward_logits(ids, mask), labels, weights).item()
+            bs, bw = causal_lm_loss_parts(forward_logits(ids, mask), labels, weights)
+            b_sum += bs.item()
+            b_weight += bw.item()
+            source = fusion.hook_state.get("h")
             fusion.enabled = True
-            n += 1
+            fusion.branch_override = mismatched_hidden(source, mask) if source is not None else None
+            ss, sw = causal_lm_loss_parts(forward_logits(ids, mask), labels, weights)
+            s_sum += ss.item()
+            s_weight += sw.item()
+            fusion.branch_override = None
+            fs, fw = causal_lm_loss_parts(forward_logits(ids, mask), labels, weights)
+            f_sum += fs.item()
+            f_weight += fw.item()
+            fusion.enabled = True
             seen += ids.size(0)
             if args.eval_max_samples > 0 and seen >= args.eval_max_samples:
                 break
         large.train()         # 恢复训练模式(重新启用梯度检查点)
         if small_lora_model is not None:
             small_lora_model.train()
-        return f_sum / n, b_sum / n
+        return (f_sum / max(f_weight, 1.0), b_sum / max(b_weight, 1.0),
+                s_sum / max(s_weight, 1.0))
 
     # ── 训练循环 ──
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     fusion.train()
     train_ce_history = []   # (step, ce) 每一步训练 CE
-    eval_history = []       # (step, fusion_loss, baseline_loss)
+    eval_history = []       # (step, fusion_loss, baseline_loss, shuffled_loss)
     best_fusion = float("inf")
+    best_useful = float("inf")
+    best_useful_step = 0
     best_step = 0
     patience_counter = 0
+    branch_no_use_evals = 0
     stop = False
     t0 = time.time()
     step = 0
@@ -525,39 +780,85 @@ def main():
             labels = labels.to(dev)
             weights = weights.to(dev)
 
+            if use_branch_warmup and step == args.branch_warmup_steps:
+                scale_param.requires_grad_(True)
+                print(f"    [阶段切换] step {step}: bridge warmup 完成，释放 branch_alpha")
+            if use_lora_delay and step == args.small_lora_delay_steps:
+                for p in small_lora_params:
+                    p.requires_grad_(True)
+                print(f"    [阶段切换] step {step}: bridge 已建立初始映射，解冻小模型 LoRA")
+
             opt.zero_grad()
             fusion.enabled = True
             large.train()                     # 确保梯度检查点生效
             if small_lora_model is not None:
-                small_lora_model.train()
+                if use_lora_delay and step < args.small_lora_delay_steps:
+                    small_lora_model.eval()
+                else:
+                    small_lora_model.train()
+
+            # reference 全部 no_grad 且在正确分支之前执行。默认任务引导只需要
+            # 冻结 4B baseline；shuffled 仅供显式开启的旧 JS 使用，不参与默认训练。
+            guide_step = args.guide_weight > 0 and step % args.guide_every == 0
+            need_reference = guide_step or args.contrast_weight > 0
+            zero_losses = shuffled_logits = None
+            if need_reference:
+                large.eval()
+                if small_lora_model is not None:
+                    small_lora_model.eval()
+                with torch.no_grad():
+                    fusion.enabled = False
+                    zero_logits = forward_logits(ids, mask)
+                    if guide_step:
+                        zero_losses = causal_lm_loss_per_example(
+                            zero_logits, labels, weights)
+                    del zero_logits
+                    if args.contrast_weight > 0:
+                        source = fusion.hook_state.get("h")
+                        fusion.enabled = True
+                        fusion.branch_override = (
+                            mismatched_hidden(source, mask) if source is not None else None)
+                        shuffled_logits = forward_logits(ids, mask)
+                        fusion.branch_override = None
+                large.train()
+                if small_lora_model is not None:
+                    if use_lora_delay and step < args.small_lora_delay_steps:
+                        small_lora_model.eval()
+                    else:
+                        small_lora_model.train()
+
+            fusion.enabled = True
             logits = forward_logits(ids, mask)
             ce = causal_lm_loss(logits, labels, weights)
             total = ce
 
-            contrast = None
-            if args.contrast_weight > 0:
-                # 错配旁路: batch 内交换 h12(batch=1 时加噪声, 同 InterLat 的退化处理)
-                h12 = fusion.hook_state.get("h")
-                if h12 is not None:
-                    h12_swap = h12.detach()
-                    B = h12_swap.size(0)
-                    h12_swap = h12_swap[torch.arange(B - 1, -1, -1)] if B >= 2 \
-                        else h12_swap + torch.randn_like(h12_swap) * 0.01
-                    fusion.branch_override = h12_swap
-                    large.eval()
-                    with torch.no_grad():
-                        logits_r = forward_logits(ids, mask)
-                    large.train()
-                    fusion.branch_override = None
-                    # 关键: rand 前向的 capture 钩子覆盖了 state["h"],必须恢复成
-                    # 正常前向的 h12,否则 backward 重算时 branch 图结构不一致 → checkpoint 报错
-                    fusion.hook_state["h"] = h12
-                    contrast = js_contrastive(logits, logits_r, labels)
-                    total = total + args.contrast_weight * contrast
+            guide = guide_active = None
+            if guide_step and zero_losses is not None:
+                guide, guide_active = baseline_improvement_loss(
+                    logits, zero_losses, labels, weights, margin=args.guide_margin)
+                total = total + args.guide_weight * guide
 
+            contrast = None
+            if args.contrast_weight > 0 and shuffled_logits is not None:
+                contrast = js_contrastive(logits, shuffled_logits, labels)
+                total = total + args.contrast_weight * contrast
+            if not torch.isfinite(total):
+                raise FloatingPointError(
+                    f"step {step + 1}: 训练 loss 非有限(CE={float(ce.detach())})")
             total.backward()
-            torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
+            # 分组裁剪，避免 44M/88M bridge 的总梯度范数把小 LoRA 的更新一并压小。
+            bridge_grad = torch.nn.utils.clip_grad_norm_(
+                bridge_params, args.grad_clip, error_if_nonfinite=True)
+            lora_grad = (torch.nn.utils.clip_grad_norm_(
+                small_lora_params, args.small_lora_grad_clip, error_if_nonfinite=True)
+                if small_lora_params else torch.tensor(0.0))
+            alpha_grad = torch.nn.utils.clip_grad_norm_(
+                scale_params, args.alpha_grad_clip, error_if_nonfinite=True)
             opt.step()
+            if fusion.gate_mode == "rezero" and args.branch_alpha_max > 0:
+                with torch.no_grad():
+                    fusion.branch_alpha.clamp_(
+                        -args.branch_alpha_max, args.branch_alpha_max)
             if scheduler is not None:
                 scheduler.step()
 
@@ -565,18 +866,48 @@ def main():
             train_ce_history.append((step, ce.item()))
             if step % args.log_every == 0:
                 el = time.time() - t0
-                gate = float(torch.sigmoid(fusion.gate_logit).detach())
+                gate = float(fusion.scale().detach())
                 extra = f" | js对比 {contrast.item():.4f}" if contrast is not None else ""
+                if guide is not None:
+                    extra += (f" | baseline引导 {guide.item():.4f}"
+                              f"(active={float(guide_active):.1%})")
+                lrs = ",".join(f"{g['name']}={g['lr']:.2e}" for g in opt.param_groups)
+                grads = (f"bridge={float(bridge_grad):.2e},"
+                         f"lora={float(lora_grad):.2e},alpha={float(alpha_grad):.2e}")
+                branch_ratio = fusion.hook_state.get("branch_rms_ratio", float("nan"))
+                health = diagnose_train_branch(
+                    branch_ratio, gate, bridge_grad,
+                    alpha_grad=alpha_grad, lora_grad=lora_grad,
+                    alpha_trainable=scale_param.requires_grad,
+                    lora_trainable=any(p.requires_grad for p in small_lora_params),
+                    min_ratio=args.branch_min_rms_ratio,
+                    max_ratio=args.branch_max_rms_ratio)
+                health_text = "OK" if not health else "WARN: " + "; ".join(health)
                 print(f"epoch {ep + 1} step {step:>6} | CE {ce.item():.4f}{extra} "
-                      f"| gate {gate:.5f} | lr {opt.param_groups[0]['lr']:.2e} | {el:.0f}s")
+                      f"| branch_scale {gate:.5f} | branch/base RMS {branch_ratio:.4f} "
+                      f"| lr[{lrs}] | grad[{grads}] | health[{health_text}] | {el:.0f}s")
 
             if eval_loader is not None and step % args.eval_every == 0:
-                f_loss, b_loss = evaluate()
-                eval_history.append((step, f_loss, b_loss))
-                gate = float(torch.sigmoid(fusion.gate_logit).detach())
+                f_loss, b_loss, s_loss = evaluate()
+                eval_history.append((step, f_loss, b_loss, s_loss))
+                gate = float(fusion.scale().detach())
+                branch_state, branch_message = classify_branch_evaluation(
+                    f_loss, b_loss, s_loss, args.branch_loss_tolerance)
+                if branch_state == "USEFUL":
+                    branch_no_use_evals = 0
+                else:
+                    branch_no_use_evals += 1
                 print(f"    [评估] step {step:>6} | fusion {f_loss:.4f} | "
                       f"baseline {b_loss:.4f} | 增益 {b_loss - f_loss:+.4f} "
-                      f"(>0=旁路有用) | gate {gate:.5f}")
+                      f"| shuffled {s_loss:.4f} | 对错配优势 {s_loss - f_loss:+.4f} "
+                      f"| branch_scale {gate:.5f}")
+                print(f"    [分支诊断] {branch_state}: {branch_message} "
+                      f"| 连续无 USEFUL 证据 {branch_no_use_evals} 次")
+                if (args.branch_health_patience > 0
+                        and branch_no_use_evals >= args.branch_health_patience):
+                    print("    [分支告警] 已连续多次未观察到正确旁路同时优于 zero/shuffled；"
+                          "请检查 alpha、branch/base RMS、bridge 梯度及接入位置。"
+                          "训练继续，不自动中止。")
                 # 早停: 评估 fusion loss 连续 patience 次无改善(改善阈值 1e-4)就停
                 if f_loss < best_fusion - 1e-4:
                     best_fusion, best_step = f_loss, step
@@ -584,6 +915,12 @@ def main():
                     save_fusion_experiment(fusion, out_path + ".best", small_lora_model)
                 else:
                     patience_counter += 1
+                # “最低 fusion CE”不等于“旁路被有效使用”。另存一份同时优于关闭
+                # 和错配旁路的 checkpoint，正式生成评测优先采用这份证据更强的权重。
+                if f_loss < b_loss and f_loss < s_loss and f_loss < best_useful - 1e-4:
+                    best_useful, best_useful_step = f_loss, step
+                    save_fusion_experiment(
+                        fusion, out_path + ".best_useful", small_lora_model)
                 if args.patience > 0 and patience_counter >= args.patience:
                     print(f"    早停触发: {args.patience} 次评估无改善 "
                           f"(最优 fusion {best_fusion:.4f} @ step {best_step})")
@@ -599,6 +936,12 @@ def main():
     print(f"\n训练完成, 共 {step} 步, 旁路参数已保存: {out_path}")
     if best_fusion < float("inf"):
         print(f"最优 fusion loss {best_fusion:.4f} @ step {best_step}, 已保存: {out_path}.best")
+    if best_useful < float("inf"):
+        print(f"最优有效旁路 loss {best_useful:.4f} @ step {best_useful_step}, "
+              f"已保存: {out_path}.best_useful")
+    elif eval_loader is not None:
+        print("[警告] 本次训练没有 checkpoint 同时优于 zero 与 shuffled；"
+              "不能据此声称小模型旁路有价值")
     print("验证: 在 test_fusion.py 里 load_fusion 后解码, 或直接跑 python main.py 看效果")
 
 

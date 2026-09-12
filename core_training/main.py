@@ -8,7 +8,7 @@
   2. attach_fusion 用前向钩子把门控残差旁路挂到 4B 上:
      第 pos1 层输出 → adapter1(2560→1024) → 0.6B 中段层 → adapter2(1024→2560)
      → ×gate → 加回第 pos2 层残差流。
-  3. 4B 正常前向 + 文本解码(旁路可训练,初始 gate≈0 严格保持原 4B 行为)。
+  3. 4B 正常前向 + 文本解码(旁路用 ReZero alpha=0 严格保持原 4B 行为)。
 
 依赖: torch / transformers / modelscope(自动定位模型本地路径)
 运行: python main.py
@@ -294,8 +294,8 @@ class GatedResidualFusion(nn.Module):
     门控残差旁路(新架构):
       branch(h) = gate_out · adapter2( small_mid( adapter1(h) ) )
     其中 small_mid = 0.6B 的 1/3~2/3 层(冻结,仅作可导计算通道)。
-    初始: gate_out = sigmoid(-10) ≈ 0 且 adapter2 零初始化 → branch ≡ 0,
-    严格保持原 4B 输出不变(identity preservation)。
+    新版使用 ReZero 标量 branch_alpha=0，适配器可以非零随机初始化，同时
+    严格保持原 4B 输出不变。gate_logit 仅用于兼容旧 checkpoint。
     """
 
     def __init__(self, small_model, s1: int, s2: int,
@@ -308,16 +308,119 @@ class GatedResidualFusion(nn.Module):
         self.output_norm = nn.RMSNorm(d_large, eps=1e-6)
         self.adapter1 = GatedAdapter(d_large, d_small, mlp_dim, bridge_depth)
         self.adapter2 = GatedAdapter(d_small, d_large, mlp_dim, bridge_depth)
+        # RMSNorm 的 gamma 若可训练，会与外层 branch_alpha 形成 alpha*gamma 的
+        # 尺度退化，使 alpha 不再代表真实旁路强度。fusion 内所有 RMS gamma 固定为 1；
+        # bridge 仍通过线性层/GLU 学方向，唯一全局幅度交给 branch_alpha。
+        for module in self.modules():
+            if isinstance(module, nn.RMSNorm):
+                module.weight.requires_grad_(False)
         # 0.6B 的 1/3~2/3 层(冻结使用: 不更新参数,但梯度可穿过它回传)。
         # 用普通 list 而非 ModuleList: 这些层属于小模型本体,不应混入 fusion 的 state_dict
         self.small_layers = [small_model.model.layers[i] for i in range(s1, s2 + 1)]
         for layer in self.small_layers:
             for p in layer.parameters():
                 p.requires_grad_(False)
-        # 旁路级门控: 初始 -10 → sigmoid ≈ 4.5e-5 ≈ 0(初始旁路不生效)
-        self.gate_logit = nn.Parameter(torch.tensor(-10.0))
+        # 新训练使用 ReZero：alpha=0 时主模型严格恒等，但 alpha 自身第一步仍有梯度；
+        # 避免“输出投影为零导致整条旁路无梯度”和“随机旁路一开始就污染主模型”的两难。
+        self.branch_alpha = nn.Parameter(torch.tensor(0.0))
+        # 旧版 checkpoint 只有 gate_logit，并使用 sigmoid 门控。参数保留用于兼容加载，
+        # 新版默认冻结它，避免优化器更新一个未参与前向的参数。
+        self.gate_logit = nn.Parameter(torch.tensor(-10.0), requires_grad=False)
+        object.__setattr__(self, "gate_mode", "rezero")
         self.small_dev = None
         self.small_dtype = None
+        self.large_dev = None
+        self.large_dtype = None
+        object.__setattr__(self, "_generation_mode", False)
+        object.__setattr__(self, "_small_cache", None)
+        object.__setattr__(self, "_small_cache_length", 0)
+        object.__setattr__(self, "_small_cache_batch", None)
+
+    def scale(self):
+        if self.gate_mode == "sigmoid":
+            return torch.sigmoid(self.gate_logit)
+        return self.branch_alpha
+
+    def begin_generation(self):
+        """开始一次新的自回归生成，并清空上一题的小模型 KV cache。"""
+        object.__setattr__(self, "_generation_mode", True)
+        self.reset_generation_cache()
+
+    def end_generation(self):
+        """结束生成，防止 cache 状态泄漏到训练、验证 loss 或下一道题。"""
+        object.__setattr__(self, "_generation_mode", False)
+        self.reset_generation_cache()
+
+    def reset_generation_cache(self):
+        object.__setattr__(self, "_small_cache", None)
+        object.__setattr__(self, "_small_cache_length", 0)
+        object.__setattr__(self, "_small_cache_batch", None)
+
+    def _run_small_full(self, x):
+        """训练/整段前向：小模型片段一次处理完整序列。"""
+        from transformers.models.qwen3.modeling_qwen3 import (
+            create_causal_mask, create_sliding_window_causal_mask)
+        sm = self.small_model_ref
+        B, L, _ = x.shape
+        pos_ids = torch.arange(L, device=x.device).unsqueeze(0)
+        cache_position = torch.arange(L, device=x.device)
+        pos_emb = sm.rotary_emb(x, pos_ids)
+        mask_kwargs = dict(config=sm.config, inputs_embeds=x,
+                           attention_mask=None, cache_position=cache_position,
+                           past_key_values=None, position_ids=pos_ids)
+        mask_map = {"full_attention": create_causal_mask(**mask_kwargs)}
+        if getattr(sm, "has_sliding_layers", False):
+            mask_map["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+        layer_types = getattr(sm.config, "layer_types", None)
+        if layer_types is None:
+            layer_types = ["full_attention"] * sm.config.num_hidden_layers
+        h = x
+        for j, layer in enumerate(sm.layers[self.s1:self.s2 + 1]):
+            mask = mask_map[layer_types[self.s1 + j]]
+            h = layer(h, attention_mask=mask, position_embeddings=pos_emb,
+                      position_ids=pos_ids, cache_position=cache_position,
+                      past_key_values=None, use_cache=False)
+        return h
+
+    def _run_small_cached(self, x):
+        """生成前向：prefill 建 cache，之后逐 token 追加，语义等价于完整因果前向。"""
+        from transformers import DynamicCache
+        sm = self.small_model_ref
+        B, L, _ = x.shape
+        if self._small_cache is None or self._small_cache_batch != B:
+            object.__setattr__(self, "_small_cache", DynamicCache(config=sm.config))
+            object.__setattr__(self, "_small_cache_length", 0)
+            object.__setattr__(self, "_small_cache_batch", B)
+        start = self._small_cache_length
+        cache_position = torch.arange(start, start + L, device=x.device)
+        pos_ids = cache_position.unsqueeze(0)
+        pos_emb = sm.rotary_emb(x, pos_ids)
+
+        # 显式构造 (B,1,Q,K) 因果掩码。DynamicCache 的第 0 层未被旁路使用，
+        # 直接调用通用 create_causal_mask 会从第 0 层读到错误的 KV 长度。
+        key_pos = torch.arange(start + L, device=x.device).view(1, -1)
+        query_pos = cache_position.view(-1, 1)
+        blocked = key_pos > query_pos
+        base_mask = torch.zeros((L, start + L), device=x.device, dtype=x.dtype)
+        base_mask.masked_fill_(blocked, torch.finfo(x.dtype).min)
+        full_mask = base_mask.view(1, 1, L, start + L).expand(B, 1, L, start + L)
+
+        layer_types = getattr(sm.config, "layer_types", None)
+        if layer_types is None:
+            layer_types = ["full_attention"] * sm.config.num_hidden_layers
+        h = x
+        for j, layer in enumerate(sm.layers[self.s1:self.s2 + 1]):
+            mask = full_mask
+            if layer_types[self.s1 + j] == "sliding_attention":
+                window = int(getattr(sm.config, "sliding_window", start + L) or (start + L))
+                too_old = key_pos < (query_pos - window + 1)
+                mask = base_mask.masked_fill(too_old, torch.finfo(x.dtype).min)
+                mask = mask.view(1, 1, L, start + L).expand(B, 1, L, start + L)
+            h = layer(h, attention_mask=mask, position_embeddings=pos_emb,
+                      position_ids=pos_ids, cache_position=cache_position,
+                      past_key_values=self._small_cache, use_cache=True)
+        object.__setattr__(self, "_small_cache_length", start + L)
+        return h
 
     def forward(self, h):
         """h: (B, L, d_large) 为 4B 在 1/3 处(第 pos1 层输出)的隐状态;
@@ -325,41 +428,15 @@ class GatedResidualFusion(nn.Module):
         x = self.input_norm(h)                           # ① 输入归一化 → 单位尺度
         x = self.adapter1(x)
         x = x.to(device=self.small_dev, dtype=self.small_dtype)
-        # 零拷贝复刻 Qwen3Model.forward 的层循环(用真实层对象 + 真实 rotary + 官方掩码):
-        # 与正常前向逐参一致,绕开一切"子模型重建/深拷贝"的组件状态不一致问题
-        from transformers.models.qwen3.modeling_qwen3 import (
-            create_causal_mask, create_sliding_window_causal_mask)
         sm = self.small_model_ref
-        B, L, _ = x.shape
-        pos_ids = torch.arange(L, device=self.small_dev).unsqueeze(0)
-        cache_position = torch.arange(L, device=self.small_dev)   # transformers 5.3 需要该参数
-        pos_emb = sm.rotary_emb(x, pos_ids)                      # 真实 rotary: cos/sin (B, L, D)
-        # 与官方 Qwen3Model.forward 一致: create_causal_mask 返回的是「单个掩码」(张量或 None),
-        # 不是字典。需要自己按层类型组装映射表;None 直接传给层的 attention_mask 即可
-        # (层内部会自行构建因果掩码)。
-        mask_kwargs = dict(config=sm.config, inputs_embeds=x,
-                           attention_mask=None, cache_position=cache_position,
-                           past_key_values=None, position_ids=pos_ids)
-        mask_map = {"full_attention": create_causal_mask(**mask_kwargs)}
-        if getattr(sm, "has_sliding_layers", False):
-            mask_map["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
         h = x
-        # layer_types 兜底(与官方 Qwen3Config.__post_init__ 等价): 0.6B 无滑动窗口 → 全层 full_attention
-        layer_types = getattr(sm.config, "layer_types", None)
-        if layer_types is None:
-            layer_types = ["full_attention"] * sm.config.num_hidden_layers
         if not self.bypass_small:
-            for j, layer in enumerate(sm.layers[self.s1:self.s2 + 1]):
-                mask = mask_map[layer_types[self.s1 + j]]
-                # transformers 5.x 的层直接返回张量，不能加 [0]。
-                h = layer(h, attention_mask=mask,
-                          position_embeddings=pos_emb, position_ids=pos_ids,
-                          past_key_values=None, use_cache=False)
+            h = self._run_small_cached(x) if self._generation_mode else self._run_small_full(x)
         x = sm.norm(h)
-        x = x.to(device=h.device, dtype=h.dtype)
+        x = x.to(device=self.large_dev, dtype=self.large_dtype)
         out = self.adapter2(x)
         out = self.output_norm(out)                      # ② 输出归一化 → 与残差流同量级
-        return out * torch.sigmoid(self.gate_logit)
+        return out * self.scale()
 
 
 def resolve_small_range(config: Config, n_small: int):
@@ -415,14 +492,19 @@ def attach_fusion(model_large, model_small, config: Config) -> GatedResidualFusi
     fusion.output_norm.to(device=dev_l, dtype=dt_large)
     fusion.adapter1.to(device=dev_l, dtype=dt_large)
     fusion.adapter2.to(device=dev_l, dtype=dt_large)
+    fusion.branch_alpha.data = fusion.branch_alpha.data.to(device=dev_l)
     fusion.gate_logit.data = fusion.gate_logit.data.to(device=dev_l)  # 标量保持 float32
     fusion.small_dev = model_device(model_small)
     fusion.small_dtype = next(model_small.parameters()).dtype
+    fusion.large_dev = dev_l
+    fusion.large_dtype = dt_large
     # 零拷贝: 只存真实 0.6B 模型本体的引用与层切片下标,forward 里手工复刻官方层循环。
     # 用 object.__setattr__ 挂载,不注册为 fusion 的子模块,避免 state_dict 混入冻结权重
     object.__setattr__(fusion, "small_model_ref", model_small.model)
     object.__setattr__(fusion, "s1", s1)
     object.__setattr__(fusion, "s2", s2)
+    object.__setattr__(fusion, "l1", l1)
+    object.__setattr__(fusion, "l2", l2)
     object.__setattr__(fusion, "bypass_small", bool(config.fusion_bypass_small))
 
     state = {}
@@ -446,13 +528,21 @@ def attach_fusion(model_large, model_small, config: Config) -> GatedResidualFusi
         if h_src is None:
             return output
         branch = fusion(h_src)
+        with torch.no_grad():
+            base = output[0] if isinstance(output, tuple) else output
+            branch_rms = branch.float().pow(2).mean().sqrt()
+            base_rms = base.float().pow(2).mean().sqrt()
+            state["branch_rms"] = float(branch_rms)
+            state["branch_rms_ratio"] = float(branch_rms / base_rms.clamp_min(1e-8))
         if isinstance(output, tuple):
             h = output[0]
             return (h + branch.to(h.dtype),) + output[1:]
         return output + branch.to(output.dtype)
 
-    model_large.model.layers[l1].register_forward_hook(capture)
-    model_large.model.layers[l2].register_forward_hook(inject)
+    handles = [model_large.model.layers[l1].register_forward_hook(capture),
+               model_large.model.layers[l2].register_forward_hook(inject)]
+    object.__setattr__(fusion, "hook_handles", handles)
+    object.__setattr__(model_large, "_bes_fusion", fusion)
     n_branch = sum(p.numel() for p in fusion.adapter1.parameters()) \
                + sum(p.numel() for p in fusion.adapter2.parameters())
     print(f"    门控残差旁路已挂载: 4B 第{l1}层输出取隐状态 → 0.6B 第{s1}~{s2}层 "
@@ -467,11 +557,15 @@ def save_fusion(fusion: GatedResidualFusion, path: str):
         "meta": {
             "small_s1": int(getattr(fusion, "s1", -1)),
             "small_s2": int(getattr(fusion, "s2", -1)),
+            "large_l1": int(getattr(fusion, "l1", -1)),
+            "large_l2": int(getattr(fusion, "l2", -1)),
             "mlp_dim": int(fusion.adapter1.down.out_features),
             "bridge_depth": 1 + len(fusion.adapter1.blocks),
             "d_large": int(fusion.adapter1.down.in_features),
             "d_small": int(fusion.adapter1.up.out_features),
             "bypass_small": bool(getattr(fusion, "bypass_small", False)),
+            "gate_mode": str(getattr(fusion, "gate_mode", "rezero")),
+            "format_version": 2,
         },
     }
     torch.save(payload, path)
@@ -491,9 +585,14 @@ def load_fusion(fusion: GatedResidualFusion, path: str):
             new = (meta.get("small_s1"), meta.get("small_s2"), meta.get("mlp_dim"),
                    meta.get("bridge_depth", 1))
             if new[0] is not None and cur != new:
-                print(f"    [警告] 检查点层范围/维度与当前不符: "
-                      f"检查点 s1={new[0]} s2={new[1]} mlp={new[2]} depth={new[3]} "
-                      f"vs 当前 s1={cur[0]} s2={cur[1]} mlp={cur[2]} depth={cur[3]}")
+                raise ValueError(f"检查点层范围/维度与当前不符: "
+                                 f"checkpoint={new}, current={cur}")
+            saved_large = (meta.get("large_l1"), meta.get("large_l2"))
+            current_large = (int(getattr(fusion, "l1", -1)),
+                             int(getattr(fusion, "l2", -1)))
+            if saved_large[0] is not None and saved_large != current_large:
+                raise ValueError(f"检查点大模型接入位置不符: "
+                                 f"checkpoint={saved_large}, current={current_large}")
             saved_bypass = meta.get("bypass_small")
             current_bypass = bool(getattr(fusion, "bypass_small", False))
             if saved_bypass is not None and bool(saved_bypass) != current_bypass:
@@ -501,7 +600,24 @@ def load_fusion(fusion: GatedResidualFusion, path: str):
                                  "bridge-only 权重评测时请传 --bypass_small")
     else:
         sd = obj   # 旧版裸 state_dict
-    fusion.load_state_dict(sd)
+        meta = {}
+    legacy_gate = "branch_alpha" not in sd
+    if legacy_gate:
+        object.__setattr__(fusion, "gate_mode", "sigmoid")
+        fusion.gate_logit.requires_grad_(True)
+        fusion.branch_alpha.requires_grad_(False)
+        incompatible = fusion.load_state_dict(sd, strict=False)
+        unexpected = list(incompatible.unexpected_keys)
+        missing = [x for x in incompatible.missing_keys if x != "branch_alpha"]
+        if unexpected or missing:
+            raise RuntimeError(f"旧 checkpoint state_dict 不兼容: missing={missing}, "
+                               f"unexpected={unexpected}")
+    else:
+        mode = meta.get("gate_mode", "rezero")
+        object.__setattr__(fusion, "gate_mode", mode)
+        fusion.branch_alpha.requires_grad_(mode == "rezero")
+        fusion.gate_logit.requires_grad_(mode == "sigmoid")
+        fusion.load_state_dict(sd)
     print(f"    旁路参数已加载: {path}")
 
 
@@ -520,13 +636,20 @@ def fused_inference(model_large, tokenizer, config: Config, prompt: str):
     dev_l = model_device(model_large)
     embeds_l = model_large.model.embed_tokens(input_ids.to(dev_l))
     attention_mask = torch.ones((1, input_ids.shape[1]), device=dev_l)
-    # 预填充: 跑一遍 4B 得到最后隐状态与 KV cache(钩子在此过程中注入门控旁路)
-    with torch.inference_mode():
-        outputs = model_large.model(inputs_embeds=embeds_l,
-                                    attention_mask=attention_mask, use_cache=True)
-    past = outputs.past_key_values
-    h_last = outputs.last_hidden_state[:, -1:, :]
-    answer = decode_answer(model_large, tokenizer, h_last, past, config)
+    fusion = getattr(model_large, "_bes_fusion", None)
+    if fusion is not None and fusion.enabled:
+        fusion.begin_generation()
+    try:
+        # 预填充: 跑一遍 4B 得到最后隐状态与 KV cache；旁路同步建立自己的 KV。
+        with torch.inference_mode():
+            outputs = model_large.model(inputs_embeds=embeds_l,
+                                        attention_mask=attention_mask, use_cache=True)
+        past = outputs.past_key_values
+        h_last = outputs.last_hidden_state[:, -1:, :]
+        answer = decode_answer(model_large, tokenizer, h_last, past, config)
+    finally:
+        if fusion is not None:
+            fusion.end_generation()
 
     stats = {
         "prompt_tokens": int(input_ids.shape[1]),
@@ -611,13 +734,15 @@ def main():
         model_small = AutoModelForCausalLM.from_pretrained(
             small_path, dtype=dt, device_map=config.device_map_small or config.device_map)
         model_small.eval()
-        tokenizer = AutoTokenizer.from_pretrained(small_path)   # 两模型共用同一分词器
+        # 4B Instruct 是最终解码模型，统一以它的 chat template 为准。两模型词表
+        # 当前相同，但不能把“词表兼容”误当作“tokenizer 配置完全相同”。
+        tokenizer = AutoTokenizer.from_pretrained(large_path)
         print(f"    0.6B: {model_small.config.num_hidden_layers} 层, 隐维 {model_small.config.hidden_size}")
     else:
         tokenizer = AutoTokenizer.from_pretrained(large_path)
     print(f"    4B : {model_large.config.num_hidden_layers} 层, 隐维 {model_large.config.hidden_size}")
 
-    # [2/3] 挂载门控残差旁路(初始 gate≈0 + 零初始化投影 → 严格保持原 4B 行为)
+    # [2/3] 挂载门控残差旁路(ReZero alpha=0 → 严格保持原 4B 行为)
     if config.fusion_enabled:
         attach_fusion(model_large, model_small, config)
 

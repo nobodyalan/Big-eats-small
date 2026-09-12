@@ -20,9 +20,20 @@ MATH_HI="${MATH_HI:-4-5}"
 MAX_NEW="${MAX_NEW:-1024}"
 SEED="${SEED:-42}"
 RUN_EVAL="${RUN_EVAL:-1}"
+RUN_CONTROLS="${RUN_CONTROLS:-0}"
 ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
 WARMUP_STEPS="${WARMUP_STEPS:-400}"
-GATE_INIT="${GATE_INIT:--2.0}"
+BRIDGE_LR="${BRIDGE_LR:-1e-4}"
+SMALL_LORA_LR="${SMALL_LORA_LR:-2e-5}"
+SMALL_LORA_DELAY_STEPS="${SMALL_LORA_DELAY_STEPS:-200}"
+ALPHA_LR="${ALPHA_LR:-5e-4}"
+BRANCH_WARMUP_STEPS="${BRANCH_WARMUP_STEPS:-400}"
+BRANCH_WARMUP_ALPHA="${BRANCH_WARMUP_ALPHA:-0.05}"
+BRANCH_ALPHA_MAX="${BRANCH_ALPHA_MAX:-0.25}"
+GUIDE_WEIGHT="${GUIDE_WEIGHT:-0}"
+GUIDE_MARGIN="${GUIDE_MARGIN:-0.02}"
+GUIDE_EVERY="${GUIDE_EVERY:-4}"
+ANSWER_WEIGHT="${ANSWER_WEIGHT:-2.0}"
 
 # 可选位置覆盖。small_end 沿用 train_fusion 的 inclusive 语义。
 POS_ARGS=()
@@ -36,7 +47,13 @@ COMMON=(--data "$DATA" --max_samples "$MAX_SAMPLES" --epochs "$EPOCHS"
         --eval_samples "$EVAL_SAMPLES" --eval_every "$EVAL_EVERY"
         --eval_max_samples "$EVAL_MAX_SAMPLES" --warmup_steps "$WARMUP_STEPS"
         --grad_checkpoint 1 --attn_impl "$ATTN_IMPL"
-        --contrast_weight 0 --gate_init "$GATE_INIT" --seed "$SEED")
+        --bridge_lr "$BRIDGE_LR" --small_lora_lr "$SMALL_LORA_LR" --alpha_lr "$ALPHA_LR"
+        --small_lora_delay_steps "$SMALL_LORA_DELAY_STEPS"
+        --branch_warmup_steps "$BRANCH_WARMUP_STEPS" --branch_warmup_alpha "$BRANCH_WARMUP_ALPHA"
+        --branch_alpha_max "$BRANCH_ALPHA_MAX"
+        --guide_weight "$GUIDE_WEIGHT" --guide_margin "$GUIDE_MARGIN" --guide_every "$GUIDE_EVERY"
+        --small_lora_grad_clip 0.5 --alpha_grad_clip 0.1 \
+        --contrast_weight 0 --answer_weight "$ANSWER_WEIGHT" --seed "$SEED")
 
 mkdir -p "$OUT_ROOT"
 
@@ -50,12 +67,13 @@ CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" core_training/train_fusion.py \
   --bridge_depth 2 --bridge_mlp_dim 4096 --small_lora_r 0 \
   --out "$DEEP_OUT" --plot "$OUT_ROOT/deep_bridge_seed${SEED}.png"
 
-DEEP_CKPT="$DEEP_OUT.best"
+DEEP_CKPT="$DEEP_OUT.best_useful"
+[[ -f "$DEEP_CKPT" ]] || DEEP_CKPT="$DEEP_OUT.best"
 [[ -f "$DEEP_CKPT" ]] || DEEP_CKPT="$DEEP_OUT"
 if [[ "$RUN_EVAL" == "1" ]]; then
   CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" eval/eval_math.py \
     --bench segments --limit "$ACC_LIMIT" --seed "$SEED" \
-    --math_lo "$MATH_LO" --math_hi "$MATH_HI" --max_new "$MAX_NEW" --fusion_only \
+    --math_lo "$MATH_LO" --math_hi "$MATH_HI" --max_new "$MAX_NEW" --attn_impl "$ATTN_IMPL" --fusion_only \
     --bridge_depth 2 --bridge_mlp_dim 4096 "${POS_ARGS[@]}" \
     --ckpt "$DEEP_CKPT" --out_dir "$OUT_ROOT/eval" \
     --tag "deep_bridge_seed${SEED}"
@@ -69,16 +87,17 @@ SMALL_OUT="$OUT_ROOT/small_lora_seed${SEED}.pt"
 CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" core_training/train_fusion.py \
   "${COMMON[@]}" "${POS_ARGS[@]}" \
   --bridge_depth 1 --bridge_mlp_dim 4096 \
-  --small_lora_r 32 --small_lora_alpha 64 --small_lora_dropout 0.05 \
+  --small_lora_r 32 --small_lora_alpha 64 --small_lora_dropout 0.0 \
   --out "$SMALL_OUT" --plot "$OUT_ROOT/small_lora_seed${SEED}.png"
 
-SMALL_CKPT="$SMALL_OUT.best"
+SMALL_CKPT="$SMALL_OUT.best_useful"
+[[ -f "$SMALL_CKPT" ]] || SMALL_CKPT="$SMALL_OUT.best"
 [[ -f "$SMALL_CKPT" ]] || SMALL_CKPT="$SMALL_OUT"
 SMALL_LORA_CKPT="$SMALL_CKPT.small_lora"
 if [[ "$RUN_EVAL" == "1" ]]; then
   CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" eval/eval_math.py \
     --bench segments --limit "$ACC_LIMIT" --seed "$SEED" \
-    --math_lo "$MATH_LO" --math_hi "$MATH_HI" --max_new "$MAX_NEW" --fusion_only \
+    --math_lo "$MATH_LO" --math_hi "$MATH_HI" --max_new "$MAX_NEW" --attn_impl "$ATTN_IMPL" --fusion_only \
     --bridge_depth 1 --bridge_mlp_dim 4096 "${POS_ARGS[@]}" \
     --ckpt "$SMALL_CKPT" --small_lora_ckpt "$SMALL_LORA_CKPT" \
     --out_dir "$OUT_ROOT/eval" --tag "small_lora_seed${SEED}"
@@ -95,7 +114,8 @@ CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" core_training/train_lora.py \
   --eval_samples "$EVAL_SAMPLES" --eval_every "$EVAL_EVERY" \
   --eval_max_samples "$EVAL_MAX_SAMPLES" --warmup_steps "$WARMUP_STEPS" \
   --grad_checkpoint 1 --attn_impl "$ATTN_IMPL" \
-  --lora_r 64 --lora_alpha 128 --lora_dropout 0.05 --seed "$SEED" \
+  --lora_r 64 --lora_alpha 128 --lora_dropout 0.05 \
+  --answer_weight "$ANSWER_WEIGHT" --seed "$SEED" \
   --out "$LARGE_OUT" --plot "$OUT_ROOT/large_lora_r64_seed${SEED}.png"
 
 LARGE_CKPT="$LARGE_OUT.best"
@@ -103,7 +123,7 @@ LARGE_CKPT="$LARGE_OUT.best"
 if [[ "$RUN_EVAL" == "1" ]]; then
   CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" eval/eval_math.py \
     --bench segments --limit "$ACC_LIMIT" --seed "$SEED" \
-    --math_lo "$MATH_LO" --math_hi "$MATH_HI" --max_new "$MAX_NEW" --fusion_only \
+    --math_lo "$MATH_LO" --math_hi "$MATH_HI" --max_new "$MAX_NEW" --attn_impl "$ATTN_IMPL" --fusion_only \
     --lora_ckpt "$LARGE_CKPT" --out_dir "$OUT_ROOT/eval" \
     --tag "large_lora_r64_seed${SEED}"
 
@@ -112,9 +132,41 @@ if [[ "$RUN_EVAL" == "1" ]]; then
   echo "=================================================================="
   CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" eval/eval_math.py \
     --bench segments --limit "$ACC_LIMIT" --seed "$SEED" \
-    --math_lo "$MATH_LO" --math_hi "$MATH_HI" --max_new "$MAX_NEW" \
+    --math_lo "$MATH_LO" --math_hi "$MATH_HI" --max_new "$MAX_NEW" --attn_impl "$ATTN_IMPL" \
     --baseline_only --out_dir "$OUT_ROOT/eval" \
     --tag "base_4b_seed${SEED}"
+fi
+
+if [[ "$RUN_CONTROLS" == "1" ]]; then
+  echo "=================================================================="
+  echo "附加完整训练 controls: 冻结小模型标准 bridge + depth1/depth2 bridge-only"
+  echo "=================================================================="
+  for SPEC in "frozen_small:1:0" "bridge_only_d1:1:1" "bridge_only_d2:2:1"; do
+    IFS=: read -r CONTROL_NAME CONTROL_DEPTH CONTROL_BYPASS <<< "$SPEC"
+    CONTROL_OUT="$OUT_ROOT/${CONTROL_NAME}_seed${SEED}.pt"
+    CONTROL_ARGS=(--bridge_depth "$CONTROL_DEPTH" --bridge_mlp_dim 4096 --small_lora_r 0)
+    if [[ "$CONTROL_BYPASS" == "1" ]]; then
+      CONTROL_ARGS+=(--bypass_small)
+    fi
+    CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" core_training/train_fusion.py \
+      "${COMMON[@]}" "${POS_ARGS[@]}" "${CONTROL_ARGS[@]}" \
+      --out "$CONTROL_OUT" --plot "$OUT_ROOT/${CONTROL_NAME}_seed${SEED}.png"
+    CONTROL_CKPT="$CONTROL_OUT.best_useful"
+    [[ -f "$CONTROL_CKPT" ]] || CONTROL_CKPT="$CONTROL_OUT.best"
+    [[ -f "$CONTROL_CKPT" ]] || CONTROL_CKPT="$CONTROL_OUT"
+    if [[ "$RUN_EVAL" == "1" ]]; then
+      CONTROL_EVAL_ARGS=()
+      if [[ "$CONTROL_BYPASS" == "1" ]]; then
+        CONTROL_EVAL_ARGS+=(--bypass_small)
+      fi
+      CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" eval/eval_math.py \
+        --bench segments --limit "$ACC_LIMIT" --seed "$SEED" \
+        --math_lo "$MATH_LO" --math_hi "$MATH_HI" --max_new "$MAX_NEW" --attn_impl "$ATTN_IMPL" --fusion_only \
+        --bridge_depth "$CONTROL_DEPTH" --bridge_mlp_dim 4096 "${POS_ARGS[@]}" \
+        "${CONTROL_EVAL_ARGS[@]}" --ckpt "$CONTROL_CKPT" \
+        --out_dir "$OUT_ROOT/eval" --tag "${CONTROL_NAME}_seed${SEED}"
+    fi
+  done
 fi
 
 echo "全部完成。结果目录: $OUT_ROOT"

@@ -3,10 +3,12 @@
 在 Qwen3-4B 前向的 1/3~2/3 层之间插入一条由 Qwen3-0.6B 中段层构成的可训练旁路：
 
 ```
-第 12 层输出 → adapter1(2560→1024) → 0.6B 第 9~18 层 → adapter2(1024→2560) → ×gate → 加回第 24 层残差流
+第 12 层输出 → adapter1(2560→1024) → 0.6B 第 9~18 层 → adapter2(1024→2560) → ×ReZero scale → 加回第 24 层残差流
 ```
 
-冻结两个大模型，只训练约 **22M** 旁路参数。初始 `gate≈0` + `adapter2` 零初始化保证旁路输出恒为 0（不破坏原 4B）。
+冻结两个基础模型，默认 width=4096/depth=1 时训练约 **44M** 旁路参数。新版使用
+`branch_alpha=0` 的 ReZero 门控：适配器可正常随机初始化，同时 step 0 严格保持原 4B。
+生成阶段为小模型片段维护独立 KV cache，使逐 token 解码与训练时完整因果前向一致。
 
 ## 目录结构
 
@@ -63,6 +65,9 @@ bash scripts/run_selection_only.sh
 # 深 bridge / 小模型 LoRA / 标准 4B LoRA 三组实验
 bash scripts/run_capacity_lora_experiments.sh
 
+# 额外运行冻结小模型与同容量 bridge-only 完整训练 controls
+RUN_CONTROLS=1 bash scripts/run_capacity_lora_experiments.sh
+
 # 两阶段正式流程：GPU0 筛位置；GPU1 训练三组并做三段各 400 题评测
 SELECTION_GPU=0 EXPERIMENT_GPU=1 bash scripts/run_two_gpu_pipeline.sh
 
@@ -106,7 +111,20 @@ python scripts/convert_metamath.py
 | `--data` | `data/mix_all.jsonl` | 训练数据（prepare_data.py 生成，验证集在末尾） |
 | `--max_samples` | 0 | 最多训练条数（0=全部；评估集另算，不被截断） |
 | `--max_len` | 1024 | 单条最大 token 数（显存不足调小） |
-| `--lr` | 1e-4 | 学习率 |
+| `--lr` / `--bridge_lr` | 1e-4 | 随机初始化 bridge 学习率；后者优先 |
+| `--small_lora_lr` | 2e-5 | 小模型 LoRA 学习率，与 bridge 解耦 |
+| `--small_lora_delay_steps` | 200 | 先只训练 bridge，延迟解冻小模型 LoRA |
+| `--alpha_lr` | 5e-4 | `branch_alpha` 学习率（无 weight decay） |
+| `--grad_clip` / `--small_lora_grad_clip` / `--alpha_grad_clip` | 1.0 / 0.5 / 0.1 | 三组独立裁剪，避免大 bridge 范数压制 LoRA |
+| `--branch_warmup_steps` | 400 | 前 N 步固定非零 alpha，让旁路先学会有效映射 |
+| `--branch_warmup_alpha` | 0.05 | branch warmup 的固定注入系数 |
+| `--branch_alpha_max` | 0.25 | 释放后 alpha 的对称上限，防止标量快速放大旁路 |
+| `--guide_weight` | 0 | 实验性 baseline 样本重加权；当前正式训练保持关闭，只用普通 CE |
+| `--guide_margin` | 0.02 | 要求的每 token CE 优势（nats） |
+| `--guide_every` | 4 | 每 N 步计算一次引导；一次增加一个 no-grad baseline 前向 |
+| `--branch_min_rms_ratio` / `--branch_max_rms_ratio` | 1e-4 / 0.5 | 旁路实际残差相对主干 RMS 的健康区间，仅告警不改变训练 |
+| `--branch_loss_tolerance` | 1e-4 | correct/zero/shuffled 被视为无明显 CE 差异的诊断容差 |
+| `--branch_health_patience` | 3 | 连续 N 次验证无有效旁路证据后告警，不自动早停 |
 | `--batch_size` | 8 | batch（H100 建议 8~16；12GB 用 1） |
 | `--epochs` | 3 | 训练轮数 |
 | `--eval_every` | 200 | 每隔 N 步评估 fusion / baseline loss |
@@ -114,17 +132,22 @@ python scripts/convert_metamath.py
 | `--eval_batch_size` | 8 | 评估时的 batch（越大评估越快） |
 | `--eval_max_samples` | 400 | 每次评估最多用多少条（验证集大时设小，0=全部） |
 | `--patience` | 0 | 早停耐心（0=关闭） |
-| `--contrast_weight` | 0 | InterLat 式 JS 对比损失权重（防旁路塌缩，需 `--batch_size ≥ 2`） |
+| `--contrast_weight` | 0 | 旧 JS 敏感性正则；不能保证任务增益，正式实验保持关闭 |
 
 ## 输出
 
 - `cache/fusion_adapter.pt` — 最终权重
 - `cache/fusion_adapter.pt.best` — 最优权重（早停时）
+- `cache/fusion_adapter.pt.best_useful` — 验证 CE 同时优于关闭与错配旁路的最优权重
 - `cache/train_fusion_loss.png` — loss 图
 - `eval_results/` — 评测结果（`main.py` / `test_baseline.py` 生成）
 
 ## 实现要点
 
 - 适配器用 **fp32 主权重 + bf16 前向**（混合精度），避免 bf16 参数更新冻结。
-- 训练时两个 `up` 投影重初始化为小随机值（打破零初始化梯度锁）。
+- 训练时 `up` 投影用小随机值初始化，外层 ReZero scale 从 0 开始：既打破梯度锁，
+  又保证首次前向严格等于基础 4B。
+- 自回归推理时，小模型片段使用独立的、逐 token 追加的 KV cache。
+- 新 checkpoint 保存大小模型接入层位并严格校验；旧 sigmoid-gate checkpoint 仍可加载。
+- 验证 CE 按有效 response token 聚合，不再平均不同长度 batch 的均值。
 - 梯度检查点省显存，可在 12GB 显存上跑。

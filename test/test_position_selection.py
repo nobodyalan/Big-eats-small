@@ -55,7 +55,8 @@ class TorchPositionSelectionTests(unittest.TestCase):
         self.assertTrue(torch.equal(out, torch.zeros_like(out)))
 
     def test_task_candidates_keep_default_and_length_diversity(self):
-        entries = [{"L": 17, "a": 3}, {"L": 8, "a": 10}]
+        entries = [{"L": 17, "a": 3}, {"L": 8, "a": 10},
+                   {"L": 28, "a": 19}]
         full = []
         for e in entries:
             for length in (1, 2, 4):
@@ -66,6 +67,9 @@ class TorchPositionSelectionTests(unittest.TestCase):
                                     lengths=[1, 2, 4], spans=[6, 12], limit=8)
         self.assertEqual(out[0], (12, 24, 9, 19))
         self.assertGreater(len({b - a for _, _, a, b in out[1:]}), 1)
+        self.assertEqual({(L, a) for L, _, a, _ in out[1:4]},
+                         {(17, 3), (8, 10), (28, 19)})
+        self.assertGreater(len({l2 - L for L, l2, _, _ in out[1:]}), 1)
 
     def test_task_ranking_requires_value_beyond_bridge_control(self):
         shallow = {"name": "shallow", "rank_delta_nll": -8.125,
