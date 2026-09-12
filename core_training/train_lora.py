@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-LoRA 对照组训练: 对纯 4B 做 LoRA 微调, 参数预算 ≈ 门控旁路的 44M, 用于公平对比。
+标准大模型 LoRA baseline: 对纯 4B 做常规高 rank LoRA，不按 bridge 参数量缩放。
 
 与 train_fusion.py 的差异:
   - 不加载 0.6B, 无门控旁路
@@ -52,11 +52,13 @@ def main():
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--grad_checkpoint", type=int, default=0)
-    parser.add_argument("--lora_r", type=int, default=21,
-                        help="LoRA rank(21≈43.4M 参数, 对齐旁路 44.1M)")
+    parser.add_argument("--lora_r", type=int, default=64,
+                        help="LoRA rank；默认 64，约 132M 参数，不与 bridge 强行等参")
     parser.add_argument("--lora_alpha", type=int, default=0, help="LoRA alpha(0=自动 2×r)")
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     parser.add_argument("--lora_target", default=",".join(DEFAULT_TARGETS))
+    parser.add_argument("--answer_weight", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval_every", type=int, default=200)
     parser.add_argument("--eval_samples", type=int, default=4000)
     parser.add_argument("--eval_batch_size", type=int, default=8)
@@ -72,6 +74,7 @@ def main():
     args = parser.parse_args()
 
     cfg = Config()
+    cfg.seed = args.seed
     torch.manual_seed(cfg.seed)
     dt = resolve_dtype(cfg.dtype)
     print(f"精度: {dt} | CUDA: {torch.cuda.is_available()}")
@@ -120,7 +123,7 @@ def main():
     train_recs = train_pool[:args.max_samples] if args.max_samples > 0 else train_pool
     print(f"训练样本: {len(train_recs)} 条 | 评估样本: {len(eval_recs)} 条")
 
-    coll = lambda b: collate(b, tokenizer, args.max_len, 1.0)
+    coll = lambda b: collate(b, tokenizer, args.max_len, args.answer_weight)
     loader = DataLoader(TextDataset(train_recs), batch_size=args.batch_size,
                         shuffle=True, collate_fn=coll)
     eval_loader = DataLoader(TextDataset(eval_recs), batch_size=args.eval_batch_size,
@@ -157,12 +160,13 @@ def main():
         lora_sum = base_sum = 0.0
         n = 0
         seen = 0
-        for ids, mask, labels, _w in eval_loader:
+        for ids, mask, labels, weights in eval_loader:
             ids, mask, labels = ids.to(dev), mask.to(dev), labels.to(dev)
+            weights = weights.to(dev)
             model.enable_adapter_layers()
-            lora_sum += causal_lm_loss(forward_logits(ids, mask), labels).item()
+            lora_sum += causal_lm_loss(forward_logits(ids, mask), labels, weights).item()
             model.disable_adapter_layers()
-            base_sum += causal_lm_loss(forward_logits(ids, mask), labels).item()
+            base_sum += causal_lm_loss(forward_logits(ids, mask), labels, weights).item()
             model.enable_adapter_layers()
             n += 1
             seen += ids.size(0)
@@ -182,12 +186,13 @@ def main():
     t0 = time.time()
     step = 0
     for ep in range(args.epochs):
-        for ids, mask, labels, _w in loader:
+        for ids, mask, labels, weights in loader:
             ids, mask, labels = ids.to(dev), mask.to(dev), labels.to(dev)
+            weights = weights.to(dev)
             model.train()          # 确保梯度检查点生效(也开启 LoRA dropout)
             opt.zero_grad()
             logits = forward_logits(ids, mask)
-            ce = causal_lm_loss(logits, labels)
+            ce = causal_lm_loss(logits, labels, weights)
             ce.backward()
             torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
             opt.step()

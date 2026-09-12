@@ -49,6 +49,8 @@ except Exception:
     pass
 
 IGNORE = -100
+SMALL_LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj",
+                      "gate_proj", "up_proj", "down_proj"]
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -175,7 +177,29 @@ def causal_lm_loss(logits, labels, weights=None):
     return (ce * w * mask).sum() / (w * mask).sum().clamp(min=1)
 
 
-JS_MARGIN = 0.69   # JS 散度上界 ln2≈0.69(InterLat 的铰链阈值)
+def attach_small_lora(model, s1, s2, rank, alpha, dropout, targets, resume=""):
+    """只给实际使用的小模型片段挂 LoRA；调用前 fusion 已保存真实层引用。"""
+    from peft import LoraConfig, PeftModel, get_peft_model
+
+    if resume:
+        return PeftModel.from_pretrained(model, resume, is_trainable=True)
+    cfg = LoraConfig(
+        r=rank, lora_alpha=alpha, lora_dropout=dropout,
+        target_modules=targets, bias="none", task_type="CAUSAL_LM",
+        layers_to_transform=list(range(s1, s2 + 1)), layers_pattern="layers",
+    )
+    return get_peft_model(model, cfg)
+
+
+def save_fusion_experiment(fusion, path, small_lora_model=None):
+    save_fusion(fusion, path)
+    if small_lora_model is not None:
+        lora_path = path + ".small_lora"
+        small_lora_model.save_pretrained(lora_path)
+        print(f"    小模型 LoRA 已保存: {lora_path}")
+
+
+JS_MARGIN = math.log(2.0)  # JS 散度使用 nats, 理论上界 ln2
 EPS = 1e-8
 
 
@@ -195,10 +219,12 @@ def js_contrastive(logits_n, logits_r, labels, margin=JS_MARGIN):
     p = F.softmax(shift_n[valid].float(), dim=-1).clamp_min(EPS)
     q = F.softmax(shift_r[valid].float(), dim=-1).clamp_min(EPS)
     m = 0.5 * (p + q)
-    js_nats = 0.5 * F.kl_div(p.log(), m, reduction="batchmean") \
-              + 0.5 * F.kl_div(q.log(), m, reduction="batchmean")
-    js_bits = js_nats / 1.4426950408889634   # nats → bits (1/ln2)
-    return torch.clamp(margin - js_bits, min=0.0)
+    # torch.kl_div(input, target) 计算 KL(target || exp(input))，因此 input
+    # 必须是 log(m)，target 才是 p/q。旧实现把参数反了，实际算成反向 KL；
+    # 同时又错误地做了 nats/bits 换算，导致对比项尺度不可解释。
+    js_nats = 0.5 * F.kl_div(m.log(), p, reduction="batchmean") \
+              + 0.5 * F.kl_div(m.log(), q, reduction="batchmean")
+    return torch.clamp(margin - js_nats, min=0.0)
 
 
 def plot_losses(train_ce_history, eval_history, path):
@@ -257,6 +283,10 @@ def main():
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--gate_init", type=float, default=0.0,
                         help="训练起始 gate_logit(0→sigmoid=0.5);-10 会以 4.5e-5 阻塞梯度")
+    parser.add_argument("--bridge_depth", type=int, default=1,
+                        help="每个输入/输出 adapter 的深度；2≈88M bridge 参数")
+    parser.add_argument("--bridge_mlp_dim", type=int, default=None,
+                        help="bridge GLU 中间维度；None 使用 Config 默认 4096")
     parser.add_argument("--small_start", type=int, default=None,
                         help="0.6B 旁路起始层(含, 0-based); None=自动 1/3 位置")
     parser.add_argument("--small_end", type=int, default=None,
@@ -265,12 +295,24 @@ def main():
                         help="4B 取隐状态层(含, 0-based); None=自动 1/3 位置")
     parser.add_argument("--large_end", type=int, default=None,
                         help="4B 加回残差层(含, 0-based); None=自动 2/3 位置")
+    parser.add_argument("--bypass_small", action="store_true",
+                        help="跳过冻结小模型层，仅训练同容量 bridge（必要 control）")
+    parser.add_argument("--small_lora_r", type=int, default=0,
+                        help="小模型片段 LoRA rank；0=关闭，推荐实验值 32")
+    parser.add_argument("--small_lora_alpha", type=int, default=0,
+                        help="小模型 LoRA alpha；0=自动 2×rank")
+    parser.add_argument("--small_lora_dropout", type=float, default=0.05)
+    parser.add_argument("--small_lora_target", default=",".join(SMALL_LORA_TARGETS))
+    parser.add_argument("--small_lora_resume", default="",
+                        help="继续训练已保存的小模型 LoRA 目录")
     parser.add_argument("--grad_checkpoint", type=int, default=0, help="1=梯度检查点(省显存但更慢)")
     parser.add_argument("--batch_size", type=int, default=8, help="训练 batch(H100 可用 8~16)")
     parser.add_argument("--contrast_weight", type=float, default=0.5,
                         help="InterLat 式 JS 对比损失权重(0=关闭;>0 时防止旁路被无视/门控塌缩)")
     parser.add_argument("--answer_weight", type=float, default=1.0,
                         help="最终答案段(\\boxed/#### 之后)的 loss 权重(SFT 答案加权)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="训练随机种子；None 使用 Config.seed")
     parser.add_argument("--eval_every", type=int, default=200, help="每隔 N 步对比一次 baseline/fusion loss")
     parser.add_argument("--eval_samples", type=int, default=64, help="从数据里留出多少条作评估集")
     parser.add_argument("--eval_batch_size", type=int, default=8, help="评估时的 batch(越大评估越快)")
@@ -289,6 +331,8 @@ def main():
     args = parser.parse_args()
 
     cfg = Config()
+    if args.seed is not None:
+        cfg.seed = args.seed
     if args.small_start is not None:
         cfg.fusion_small_start = args.small_start
     if args.small_end is not None:
@@ -297,6 +341,10 @@ def main():
         cfg.fusion_large_start = args.large_start
     if args.large_end is not None:
         cfg.fusion_large_end = args.large_end
+    cfg.fusion_bridge_depth = args.bridge_depth
+    if args.bridge_mlp_dim is not None:
+        cfg.fusion_mlp_dim = args.bridge_mlp_dim
+    cfg.fusion_bypass_small = args.bypass_small
     torch.manual_seed(cfg.seed)
     dt = resolve_dtype(cfg.dtype)
     print(f"精度: {dt} | CUDA: {torch.cuda.is_available()}")
@@ -314,7 +362,7 @@ def main():
     attn_kwargs = {"attn_implementation": args.attn_impl} if args.attn_impl else {}
     small = AutoModelForCausalLM.from_pretrained(small_path, dtype=dt).cuda()
     large = AutoModelForCausalLM.from_pretrained(large_path, dtype=dt, **attn_kwargs).cuda()
-    # 双模型全冻结,只训旁路(22M)
+    # 基础权重先全部冻结；可选的小模型 LoRA 会在 attach_fusion 后单独启用。
     for m in (small, large):
         for p in m.parameters():
             p.requires_grad_(False)
@@ -325,7 +373,8 @@ def main():
     ts = time.strftime("%Y%m%d_%H%M%S")
     out_path = args.out or f"cache/fusion_L{l1}-{l2}_s{s1}_{s2}_{ts}.pt"
     plot_path = args.plot if args.plot is not None else f"cache/train_fusion_L{l1}-{l2}_s{s1}_{s2}_{ts}.png"
-    print(f"接入位置: 4B 第{l1}层取 → 第{l2}层加回 | 0.6B 第{s1}~{s2}层")
+    segment_desc = "bridge-only control" if args.bypass_small else f"0.6B 第{s1}~{s2}层"
+    print(f"接入位置: 4B 第{l1}层取 → 第{l2}层加回 | {segment_desc}")
     print(f"输出权重: {out_path} | loss 图: {plot_path}")
     # 梯度检查点需要模型处于 train 模式才生效;Qwen3 attention_dropout=0 无噪声
     large.train()
@@ -336,6 +385,19 @@ def main():
 
     # ── 挂载门控残差旁路 ──
     fusion = attach_fusion(large, small, cfg)
+    small_lora_model = None
+    if args.small_lora_r > 0 or args.small_lora_resume:
+        if args.bypass_small:
+            raise ValueError("--bypass_small 与 --small_lora_r/--small_lora_resume 不能同时使用")
+        targets = [x.strip() for x in args.small_lora_target.split(",") if x.strip()]
+        alpha = args.small_lora_alpha or 2 * max(1, args.small_lora_r)
+        resume_path = args.small_lora_resume
+        if not resume_path and args.resume and os.path.isdir(args.resume + ".small_lora"):
+            resume_path = args.resume + ".small_lora"
+        small_lora_model = attach_small_lora(
+            small, s1, s2, max(1, args.small_lora_r), alpha,
+            args.small_lora_dropout, targets, resume_path)
+        small_lora_model.train()
     # 关键修复: 适配器参数用 fp32 主权重。attach_fusion 把它们搬到 bf16, 若直接
     # 让 AdamW 更新 bf16 参数, 梯度小到 bf16 精度(约 3 位有效数字)就归零,
     # 训练几十步后彻底冻结。这里转回 fp32, 前向用 autocast 做 bf16 计算。
@@ -357,12 +419,22 @@ def main():
         # 才"解冻", adapter1 因此几乎学不动。训练时不需要恒等, 直接把两个 up 投影
         # 重初始化为小随机值, 让整条旁路第 0 步就有梯度; 输出尺度由 output_norm /
         # 0.6B 的 input_layernorm 归一化兜底, 不会爆炸。
-        for m in (fusion.adapter1, fusion.adapter2):
-            torch.nn.init.normal_(m.up.weight, std=0.02)
-            torch.nn.init.zeros_(m.up.bias)
-    params = [p for p in fusion.parameters() if p.requires_grad]
-    n_params = sum(p.numel() for p in params)
-    print(f"可训练旁路参数: {n_params / 1e6:.1f}M")
+        # 包括 adapter 的首层 up 以及加深 bridge 后的所有残差 block up。
+        for m in fusion.modules():
+            if hasattr(m, "up") and isinstance(m.up, torch.nn.Linear):
+                torch.nn.init.normal_(m.up.weight, std=0.02)
+                torch.nn.init.zeros_(m.up.bias)
+    bridge_params = [p for p in fusion.parameters() if p.requires_grad]
+    small_lora_params = ([p for p in small_lora_model.parameters() if p.requires_grad]
+                         if small_lora_model is not None else [])
+    for p in small_lora_params:
+        p.data = p.data.float()
+    params = bridge_params + small_lora_params
+    n_bridge = sum(p.numel() for p in bridge_params)
+    n_small_lora = sum(p.numel() for p in small_lora_params)
+    print(f"可训练参数: bridge {n_bridge / 1e6:.2f}M | "
+          f"small LoRA {n_small_lora / 1e6:.2f}M | "
+          f"总计 {(n_bridge + n_small_lora) / 1e6:.2f}M")
 
     opt = torch.optim.AdamW(params, lr=args.lr)
     dev = model_device(large)
@@ -413,21 +485,26 @@ def main():
     def evaluate():
         """在评估集上算 (fusion_loss, baseline_loss) 均值;baseline 关掉旁路"""
         large.eval()          # 关梯度检查点(只在 train 模式生效),no_grad 下干净前向
+        if small_lora_model is not None:
+            small_lora_model.eval()
         f_sum = b_sum = 0.0
         n = 0
         seen = 0
-        for ids, mask, labels, _w in eval_loader:
+        for ids, mask, labels, weights in eval_loader:
             ids, mask, labels = ids.to(dev), mask.to(dev), labels.to(dev)
+            weights = weights.to(dev)
             fusion.enabled = True
-            f_sum += causal_lm_loss(forward_logits(ids, mask), labels).item()
+            f_sum += causal_lm_loss(forward_logits(ids, mask), labels, weights).item()
             fusion.enabled = False
-            b_sum += causal_lm_loss(forward_logits(ids, mask), labels).item()
+            b_sum += causal_lm_loss(forward_logits(ids, mask), labels, weights).item()
             fusion.enabled = True
             n += 1
             seen += ids.size(0)
             if args.eval_max_samples > 0 and seen >= args.eval_max_samples:
                 break
         large.train()         # 恢复训练模式(重新启用梯度检查点)
+        if small_lora_model is not None:
+            small_lora_model.train()
         return f_sum / n, b_sum / n
 
     # ── 训练循环 ──
@@ -451,6 +528,8 @@ def main():
             opt.zero_grad()
             fusion.enabled = True
             large.train()                     # 确保梯度检查点生效
+            if small_lora_model is not None:
+                small_lora_model.train()
             logits = forward_logits(ids, mask)
             ce = causal_lm_loss(logits, labels, weights)
             total = ce
@@ -502,7 +581,7 @@ def main():
                 if f_loss < best_fusion - 1e-4:
                     best_fusion, best_step = f_loss, step
                     patience_counter = 0
-                    save_fusion(fusion, out_path + ".best")
+                    save_fusion_experiment(fusion, out_path + ".best", small_lora_model)
                 else:
                     patience_counter += 1
                 if args.patience > 0 and patience_counter >= args.patience:
@@ -514,7 +593,7 @@ def main():
         if stop:
             break
 
-    save_fusion(fusion, out_path)
+    save_fusion_experiment(fusion, out_path, small_lora_model)
     if plot_path:
         plot_losses(train_ce_history, eval_history, plot_path)
     print(f"\n训练完成, 共 {step} 步, 旁路参数已保存: {out_path}")

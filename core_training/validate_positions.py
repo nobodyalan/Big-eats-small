@@ -28,6 +28,14 @@ EVAL_PAT = re.compile(
     r"\[评估\].*?fusion\s+([\d.e+\-]+).*?baseline\s+([\d.e+\-]+).*?增益\s+([+\-][\d.e+\-]+)")
 
 
+def inclusive_small_end(b_exclusive):
+    """把筛选器的右开边界转换为 train_fusion 的 inclusive 参数。"""
+    b_exclusive = int(b_exclusive)
+    if b_exclusive <= 0:
+        raise ValueError("exclusive small end 必须大于 0")
+    return b_exclusive - 1
+
+
 def parse_best(log_path):
     """从训练日志里找 fusion loss 最低的那次评估, 返回 (fusion, baseline, gain) 或 None"""
     best = None
@@ -43,15 +51,18 @@ def parse_best(log_path):
     return best
 
 
-def load_candidates(json_path, topn):
-    """从 select_positions.py 的结果里取 top-N 个去重的 (L, a, b)。
-    优先用出口筛选 Q 的排序(exit), 否则退回 top_full(E_seg)。"""
+def load_candidates(json_path, topn, fallback_span=12):
+    """读取任务感知候选，返回 (L,l2,a,b_exclusive)。"""
     with open(json_path, encoding="utf-8") as f:
         data = json.load(f)
-    src = data.get("exit") or data.get("top_full") or []
+    src = data.get("task_aware") or data.get("exit") or data.get("top_full") or []
     seen, cands = set(), []
     for x in src:
-        key = (int(x["L"]), int(x["a"]), int(x["b"]))
+        L, a, b = int(x["L"]), int(x["a"]), int(x["b"])
+        l2 = int(x.get("l2", min(L + fallback_span, 35)))
+        # select_positions 的 b 一直表示 [a,b) 的右边界；旧 validator 曾把它
+        # 错传成 inclusive small_end。这里统一保留 exclusive 语义。
+        key = (L, l2, a, b)
         if key in seen:
             continue
         seen.add(key)
@@ -67,13 +78,18 @@ def latest(pattern: str):
 
 
 def read_accuracy(out_dir: str, seg_name: str, tag: str):
-    """读某段(如 GSM8K / MATH_lo1-3 / MATH_hi4-5)的正确率, 返回 fusion_acc 或 None"""
+    """读取未舍入的正确数/总数，避免 round 后的伪排序。"""
     jf = latest(os.path.join(out_dir, f"eval_{seg_name.lower()}_{tag}_*.json"))
     if not jf:
         return None
     with open(jf, encoding="utf-8") as f:
         s = json.load(f).get("summary", {})
-    return s.get("fusion_acc", s.get("lora_acc"))
+    correct = s.get("fusion_correct", s.get("lora_correct"))
+    n = s.get("n")
+    if correct is None or not n:
+        return None
+    return {"correct": int(correct), "n": int(n),
+            "accuracy": int(correct) / int(n)}
 
 
 def run_one(tag, desc, pos, gpu, args):
@@ -88,12 +104,14 @@ def run_one(tag, desc, pos, gpu, args):
                  "--batch_size", str(args.batch_size), "--max_len", str(args.max_len),
                  "--grad_checkpoint", str(args.grad_checkpoint),
                  "--attn_impl", args.attn_impl, "--warmup_steps", str(args.warmup_steps),
-                 "--eval_samples", str(args.eval_samples), "--eval_every", str(args.eval_every),
-                 "--out", out_path, "--plot", ""]
+                  "--eval_samples", str(args.eval_samples), "--eval_every", str(args.eval_every),
+                  "--contrast_weight", str(args.contrast_weight), "--seed", str(args.seed),
+                  "--out", out_path, "--plot", ""]
     if pos is not None:
         L, l2, a, b = pos
         train_cmd += ["--large_start", str(L), "--large_end", str(l2),
-                      "--small_start", str(a), "--small_end", str(b)]
+                      "--small_start", str(a), "--small_end",
+                      str(inclusive_small_end(b))]
     print(f"[GPU {gpu}] 短训启动: {desc}", flush=True)
     with open(log_path, "w", encoding="utf-8") as logf:
         subprocess.call(train_cmd, stdout=logf, stderr=subprocess.STDOUT, cwd=_ROOT, env=env)
@@ -109,7 +127,8 @@ def run_one(tag, desc, pos, gpu, args):
         if pos is not None:
             L, l2, a, b = pos
             acc_cmd += ["--large_start", str(L), "--large_end", str(l2),
-                        "--small_start", str(a), "--small_end", str(b)]
+                        "--small_start", str(a), "--small_end",
+                        str(inclusive_small_end(b))]
         with open(log_path + ".acc", "w", encoding="utf-8") as logf:
             subprocess.call(acc_cmd, stdout=logf, stderr=subprocess.STDOUT, cwd=_ROOT, env=env)
         acc = {seg: read_accuracy(args.out_dir, seg, tag)
@@ -133,6 +152,9 @@ def main():
     ap.add_argument("--grad_checkpoint", type=int, default=1)
     ap.add_argument("--attn_impl", default="flash_attention_2")
     ap.add_argument("--warmup_steps", type=int, default=50)
+    ap.add_argument("--contrast_weight", type=float, default=0.0,
+                    help="位置比较默认关闭对比项，避免与任务 CE 混杂")
+    ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--eval_samples", type=int, default=256)
     ap.add_argument("--eval_every", type=int, default=50)
     ap.add_argument("--out_dir", default="cache/validate_positions")
@@ -142,6 +164,8 @@ def main():
     ap.add_argument("--math_lo", default="1-3", help="MATH 低级区间")
     ap.add_argument("--math_hi", default="4-5", help="MATH 高级区间")
     ap.add_argument("--skip_accuracy", action="store_true", help="跳过准确率评测, 只比 CE 增益")
+    ap.add_argument("--primary", choices=["gain", "ce", "micro_accuracy"], default="gain",
+                    help="候选主排序；短训默认最大化独立验证集 CE 增益")
     ap.add_argument("--gpus", default="0", help="逗号分隔的 GPU 列表(候选轮转分配, 如 0,1)")
     ap.add_argument("--parallel", type=int, default=1, help="同时跑几个候选(≤ GPU 数×每卡可容纳数)")
     args = ap.parse_args()
@@ -151,10 +175,10 @@ def main():
     # 配置列表: (文件tag, 显示描述, 位置元组或 None=默认)
     configs = [("baseline_default", "默认 1/3~2/3", None)]
     if os.path.exists(args.candidates_json):
-        for i, (L, a, b) in enumerate(load_candidates(args.candidates_json, args.topn)):
-            l2 = min(L + args.inject_span, 35)
-            tag = f"cand{i}_L{L}_{l2}_s{a}_{b}"
-            configs.append((tag, f"L={L}→{l2}, a={a}~{b}", (L, l2, a, b)))
+        for i, (L, l2, a, b) in enumerate(
+                load_candidates(args.candidates_json, args.topn, args.inject_span)):
+            tag = f"cand{i}_L{L}_{l2}_s{a}_{b}x"
+            configs.append((tag, f"L={L}→{l2}, [{a},{b})", (L, l2, a, b)))
     else:
         print(f"[提示] 未找到 {args.candidates_json}, 只跑 baseline 对照")
 
@@ -173,7 +197,8 @@ def main():
             print(f"[{r['desc']}] 最优 fusion {r['ce'][0]:.4f} | 增益 {r['ce'][2]:+.4f}")
         if r["acc"]:
             print(f"[{r['desc']}] 正确率: " + "  ".join(
-                f"{k}={v:.2%}" if v is not None else f"{k}=N/A"
+                f"{k}={v['accuracy']:.2%} ({v['correct']}/{v['n']})"
+                if v is not None else f"{k}=N/A"
                 for k, v in r["acc"].items()))
 
     # ── 汇总 ──
@@ -190,20 +215,26 @@ def main():
         if acc:
             for k in ("GSM8K", f"MATH_lo{args.math_lo}", f"MATH_hi{args.math_hi}"):
                 v = acc.get(k)
-                line += f"{v:.2%} " if v is not None else "N/A      "
-            vals = [v for v in acc.values() if v is not None]
-            line += f"{sum(vals) / len(vals):.2%}" if vals else "N/A"
+                line += f"{v['accuracy']:.2%} " if v is not None else "N/A      "
+            counts = [(v["correct"], v["n"]) for v in acc.values() if v is not None]
+            line += (f"{sum(c for c, _ in counts) / sum(n for _, n in counts):.2%}"
+                     if counts else "N/A")
         else:
             line += "N/A      N/A       N/A       N/A"
         print(line)
 
     def sort_key(r):
+        if args.primary == "gain" and r["ce"]:
+            return -r["ce"][2]
+        if args.primary == "ce" and r["ce"]:
+            return r["ce"][0]
         if r["acc"]:
-            vals = [v for v in r["acc"].values() if v is not None]
-            if vals:
-                return -sum(vals) / len(vals)   # 平均正确率越高越优(取负转最小)
+            counts = [(v["correct"], v["n"]) for v in r["acc"].values()
+                      if v is not None]
+            if counts:
+                return -sum(c for c, _ in counts) / sum(n for _, n in counts)
         if r["ce"]:
-            return r["ce"][0]                    # 否则 CE 越低越优
+            return r["ce"][0]
         return float("inf")
 
     best = min(results, key=sort_key)
@@ -212,13 +243,16 @@ def main():
         if best["pos"] is not None:
             L, l2, a, b = best["pos"]
             print(f"完整训练命令: python3 core_training/train_fusion.py "
-                  f"--large_start {L} --large_end {l2} --small_start {a} --small_end {b} ...")
+                  f"--large_start {L} --large_end {l2} --small_start {a} "
+                  f"--small_end {inclusive_small_end(b)} --contrast_weight 0 ...")
 
     summary = {"results": [
         {"name": r["desc"], "pos": r["pos"],
          "best_fusion": (r["ce"][0] if r["ce"] else None),
          "gain": (r["ce"][2] if r["ce"] else None),
-         "accuracy": r["acc"]} for r in results]}
+         "accuracy": r["acc"]} for r in results],
+         "primary_metric": args.primary, "seed": args.seed,
+         "small_segment_semantics": "[a,b) in this summary; train_fusion receives b-1"}
     out_json = os.path.join(args.out_dir, "validation_summary.json")
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)

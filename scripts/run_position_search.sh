@@ -8,9 +8,8 @@ cd "$(dirname "$0")/.."   # 切到 BES 根目录
 DATA="data/mix_all.jsonl"
 GPUS="0,1"              # 短训用哪些 GPU(逗号分隔)
 PARALLEL=2              # 同时短训几个候选
-STAGE1_GPU=1            # 阶段1(选位置)只跑单卡, 且是显存大头, 固定到空闲卡
-NUM_SAMPLES=500         # ① 入口筛选的校准样本数 (显存 ∝ NUM_SAMPLES×MAX_LEN)
-MAX_LEN=256             # 入口筛选的单条 token 上限 (显存 ∝ NUM_SAMPLES×MAX_LEN)
+NUM_SAMPLES=500         # ① 入口筛选的校准样本数
+MAX_LEN=256             # 入口筛选的单条 token 上限
 TOP_N=5                 # 出口筛选 + 短训验证的候选数
 EXIT_SAMPLES=32         # 出口筛选(Q)的校准样本数
 MAX_SAMPLES=1000        # 短训预算(样本数)
@@ -21,7 +20,7 @@ ACC_LIMIT=100            # ④ 最终准确率: 三难度各题数
 echo "=================================================================="
 echo "阶段 1/2: 数据驱动选位置(① 入口 CKA/E_in → ② 片段 E_seg → ③ 出口 Q)"
 echo "=================================================================="
-CUDA_VISIBLE_DEVICES="$STAGE1_GPU" python3 core_training/select_positions.py \
+python3 core_training/select_positions.py \
     --data "$DATA" --num_samples "$NUM_SAMPLES" --max_len "$MAX_LEN" \
     --topk "$TOP_N" --exit_topk "$TOP_N" --exit_samples "$EXIT_SAMPLES" \
     --out cache/position_selection.json

@@ -265,6 +265,12 @@ def load_aime_test(seed: int, limit: int):
 def main():
     parser = argparse.ArgumentParser(description="MATH / GSM8K 分层评测: fusion vs baseline")
     parser.add_argument("--ckpt", default="", help="训练好的 fusion 权重(空=用初始恒等旁路)")
+    parser.add_argument("--small_lora_ckpt", default="",
+                        help="与 fusion 配套的小模型 LoRA 目录")
+    parser.add_argument("--bridge_depth", type=int, default=1,
+                        help="fusion bridge 深度，必须与 checkpoint 一致")
+    parser.add_argument("--bridge_mlp_dim", type=int, default=None,
+                        help="fusion bridge 中间维度，必须与 checkpoint 一致")
     parser.add_argument("--lora_ckpt", default="",
                         help="LoRA 权重目录(给定则评测 LoRA 模型; 与 --ckpt 同给=并行评测两者)")
     parser.add_argument("--small_start", type=int, default=None,
@@ -275,6 +281,8 @@ def main():
                         help="4B 取隐状态层(含, 0-based); None=自动 1/3 位置")
     parser.add_argument("--large_end", type=int, default=None,
                         help="4B 加回残差层(含, 0-based); None=自动 2/3 位置")
+    parser.add_argument("--bypass_small", action="store_true",
+                        help="评测 bridge-only control checkpoint")
     parser.add_argument("--fusion_device", default="", help="旁路模型设备(空=自动 cuda:0)")
     parser.add_argument("--lora_device", default="", help="LoRA 模型设备(空=自动另一张卡)")
     parser.add_argument("--bench", default="both",
@@ -291,9 +299,15 @@ def main():
     parser.add_argument("--math_hi", default="4-5",
                         help="segments 模式下 MATH 高级区间(如 4-5 / 5)")
     parser.add_argument("--fusion_only", action="store_true", help="只测 fusion, 跳过 baseline")
+    parser.add_argument("--baseline_only", action="store_true",
+                        help="只测纯 4B baseline；不加载小模型、bridge 或 LoRA")
     parser.add_argument("--out_dir", default="eval_results")
     parser.add_argument("--tag", default="", help="输出文件名标签(并行多模型评测时用于区分)")
     args = parser.parse_args()
+    if args.fusion_only and args.baseline_only:
+        parser.error("--fusion_only 与 --baseline_only 不能同时使用")
+    if args.baseline_only and (args.ckpt or args.small_lora_ckpt or args.lora_ckpt):
+        parser.error("--baseline_only 不应同时传入实验 checkpoint")
 
     # ── 选择 benchmark(数据 + 判分函数) ──
     benches = []
@@ -330,6 +344,9 @@ def main():
 
     # ── 加载模型(旁路 / LoRA / 两者并行) ──
     cfg = Config()
+    cfg.fusion_bridge_depth = args.bridge_depth
+    if args.bridge_mlp_dim is not None:
+        cfg.fusion_mlp_dim = args.bridge_mlp_dim
     if args.small_start is not None:
         cfg.fusion_small_start = args.small_start
     if args.small_end is not None:
@@ -338,15 +355,17 @@ def main():
         cfg.fusion_large_start = args.large_start
     if args.large_end is not None:
         cfg.fusion_large_end = args.large_end
+    cfg.fusion_bypass_small = args.bypass_small
     dt = resolve_dtype(cfg.dtype)
     large_path = resolve_model_path(cfg.model_large_id, cfg.model_large_local)
 
     # 两个模型可同时挂载(旁路放 fusion 设备, LoRA 放另一张卡), 一次性并行验证两者正确率
-    have_fusion = (not args.lora_ckpt) or bool(args.ckpt)   # 只给 --lora_ckpt 时不上旁路
-    have_lora = bool(args.lora_ckpt)
+    have_fusion = (not args.baseline_only) and (
+        (not args.lora_ckpt) or bool(args.ckpt))  # 只给 --lora_ckpt 时不上旁路
+    have_lora = (not args.baseline_only) and bool(args.lora_ckpt)
 
     tokenizer = None
-    large_f = large_l = None
+    large_f = large_l = large_b = None
     fusion = None
 
     def _resolve_dev(pref: str, fallback: str) -> str:
@@ -365,6 +384,12 @@ def main():
         small = AutoModelForCausalLM.from_pretrained(small_path, dtype=dt).to(fdev).eval()
         large_f = AutoModelForCausalLM.from_pretrained(large_path, dtype=dt).to(fdev).eval()
         fusion = attach_fusion(large_f, small, cfg)
+        if args.small_lora_ckpt:
+            from peft import PeftModel
+            # attach_fusion 已保存底层真实层引用；PEFT 原地替换这些层中的线性模块，
+            # 因而手写的小模型片段 forward 会自动使用 LoRA。
+            small_lora_model = PeftModel.from_pretrained(
+                small, args.small_lora_ckpt, is_trainable=False).eval()
         if args.ckpt:
             load_fusion(fusion, args.ckpt)
         gate = float(torch.sigmoid(fusion.gate_logit).detach())
@@ -384,6 +409,13 @@ def main():
         large_l = large_l.to(dt)
         large_l.eval()
         print(f"已加载 LoRA: {args.lora_ckpt} (设备 {ldev}, dtype {dt})")
+
+    if args.baseline_only:
+        tokenizer = AutoTokenizer.from_pretrained(large_path)
+        bdev = _resolve_dev(args.fusion_device, "cuda:0")
+        large_b = AutoModelForCausalLM.from_pretrained(
+            large_path, dtype=dt).to(bdev).eval()
+        print(f"已加载纯 4B baseline (设备 {bdev}, dtype {dt})")
 
     def set_fusion(on: bool):
         if fusion is not None:
@@ -415,9 +447,11 @@ def main():
                     if large_f is not None:
                         set_fusion(False)
                         pred_base = generate(large_f, tokenizer, prompt, args.max_new)
-                    else:
+                    elif large_l is not None:
                         set_lora(False)
                         pred_base = generate(large_l, tokenizer, prompt, args.max_new)
+                    else:
+                        pred_base = generate(large_b, tokenizer, prompt, args.max_new)
                 finally:
                     # generate 抛异常也要恢复为开启, 防状态残留污染后续结果
                     set_fusion(True)
@@ -480,7 +514,8 @@ def main():
         path = os.path.join(args.out_dir,
                             f"eval_{name.lower()}{tag}_{time.strftime('%Y%m%d_%H%M%S')}.json")
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({"ckpt": args.ckpt, "lora_ckpt": args.lora_ckpt,
+            json.dump({"ckpt": args.ckpt, "small_lora_ckpt": args.small_lora_ckpt,
+                       "lora_ckpt": args.lora_ckpt,
                        "small_start": args.small_start, "small_end": args.small_end,
                        "seed": args.seed, "summary": summary,
                        "results": results}, f, ensure_ascii=False, indent=2)

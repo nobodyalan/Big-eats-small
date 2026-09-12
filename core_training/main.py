@@ -59,6 +59,7 @@ class Config:
     fusion_pos1_frac: float = 1 / 3   # 4B 取隐状态的位置(36 层 → 第 12 层输出)
     fusion_pos2_frac: float = 2 / 3   # 4B 加回残差的位置(第 24 层输出)
     fusion_mlp_dim: int = 4096        # 适配器 MLP 中间层维度(可调; 4096 → 约 44M 旁路参数)
+    fusion_bridge_depth: int = 1      # 每个 adapter 的深度；2 会增加一个同输出维残差 GLU block
     # 4B 接入位置(取隐状态层/加回残差层, 0-based); None = 自动用 1/3 / 2/3 位置
     fusion_large_start: Optional[int] = None
     fusion_large_end: Optional[int] = None
@@ -66,6 +67,7 @@ class Config:
     # 例: start=0, end=-1 → 从第一个隐藏层接到最后一个隐藏层(整段 0.6B)
     fusion_small_start: Optional[int] = None
     fusion_small_end: Optional[int] = None
+    fusion_bypass_small: bool = False  # True=跳过冻结小模型层，作为 bridge-only 对照
 
     # ── 最终解码 ──────────────────────────────────────────────────────────
     max_new_tokens: int = 512
@@ -102,9 +104,59 @@ def model_device(model) -> torch.device:
 
 
 def resolve_model_path(model_id: str, local_override: Optional[str]) -> str:
-    """优先用本地路径;否则走 modelscope 定位(已下载过会命中缓存,不会重复下载)"""
+    """优先使用完整的本地缓存，只有本地没有模型时才请求 ModelScope。"""
     if local_override:
         return local_override
+
+    def is_complete_model_dir(path: str) -> bool:
+        if not os.path.isfile(os.path.join(path, "config.json")):
+            return False
+        weight_names = (
+            "model.safetensors", "model.safetensors.index.json",
+            "pytorch_model.bin", "pytorch_model.bin.index.json",
+        )
+        return any(os.path.isfile(os.path.join(path, name)) for name in weight_names)
+
+    # ModelScope 新版缓存。snapshot_download 在离线环境仍可能先请求文件列表，
+    # 因此要在调用它之前直接解析已经完整落盘的 snapshot。
+    cache_root = os.environ.get(
+        "MODELSCOPE_CACHE",
+        os.path.join(os.path.expanduser("~"), ".cache", "modelscope"),
+    )
+    model_dir_name = model_id.replace("/", "--")
+    ms_candidates = [
+        os.path.join(cache_root, "models", model_dir_name, "snapshots", "master"),
+        os.path.join(cache_root, "hub", model_id),
+        os.path.join(cache_root, "hub", "models", model_id),
+    ]
+    for path in ms_candidates:
+        if is_complete_model_dir(path):
+            return path
+
+    # Hugging Face 的 snapshots 目录可能只缓存了 config；仅选择同时含权重的版本。
+    hf_model_dir = os.path.join(
+        os.environ.get("HF_HOME", os.path.join(os.path.expanduser("~"), ".cache", "huggingface")),
+        "hub", f"models--{model_dir_name}", "snapshots",
+    )
+    if os.path.isdir(hf_model_dir):
+        snapshots = sorted(
+            (os.path.join(hf_model_dir, name) for name in os.listdir(hf_model_dir)),
+            key=os.path.getmtime,
+            reverse=True,
+        )
+        for path in snapshots:
+            if is_complete_model_dir(path):
+                return path
+
+    offline = any(
+        os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+        for name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "MODELSCOPE_OFFLINE")
+    )
+    if offline:
+        # 交给 Transformers 的 local-files-only 语义报告明确的缓存缺失错误，
+        # 不能在调用方明确要求离线时偷偷转去 ModelScope 联网。
+        return model_id
+
     try:
         from modelscope import snapshot_download
         return snapshot_download(model_id)
@@ -194,12 +246,16 @@ class GatedAdapter(nn.Module):
     MLP 维度(mlp_dim)可调。
     """
 
-    def __init__(self, in_dim: int, out_dim: int, mlp_dim: int):
+    def __init__(self, in_dim: int, out_dim: int, mlp_dim: int, depth: int = 1):
         super().__init__()
+        if depth < 1:
+            raise ValueError("bridge depth 必须 >= 1")
         self.down = nn.Linear(in_dim, mlp_dim)
         self.gate = nn.Linear(in_dim, mlp_dim)
         self.act = nn.SiLU()
         self.up = nn.Linear(mlp_dim, out_dim)
+        self.blocks = nn.ModuleList(
+            GatedResidualBlock(out_dim, mlp_dim) for _ in range(depth - 1))
         # 零初始化 up 投影: 无论 down/gate 输出什么,适配器初始输出都是 0
         nn.init.zeros_(self.up.weight)
         nn.init.zeros_(self.up.bias)
@@ -207,7 +263,30 @@ class GatedAdapter(nn.Module):
     def forward(self, x):
         d = self.act(self.down(x))
         g = torch.sigmoid(self.gate(x))
-        return self.up(d * g)
+        x = self.up(d * g)
+        for block in self.blocks:
+            x = block(x)
+        return x
+
+
+class GatedResidualBlock(nn.Module):
+    """用于加深 bridge 的预归一化残差 GLU block。"""
+
+    def __init__(self, dim: int, mlp_dim: int):
+        super().__init__()
+        self.norm = nn.RMSNorm(dim, eps=1e-6)
+        self.down = nn.Linear(dim, mlp_dim)
+        self.gate = nn.Linear(dim, mlp_dim)
+        self.up = nn.Linear(mlp_dim, dim)
+        self.act = nn.SiLU()
+        self.residual_logit = nn.Parameter(torch.tensor(-2.0))
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+
+    def forward(self, x):
+        h = self.norm(x)
+        h = self.up(self.act(self.down(h)) * torch.sigmoid(self.gate(h)))
+        return x + torch.sigmoid(self.residual_logit) * h
 
 
 class GatedResidualFusion(nn.Module):
@@ -220,15 +299,15 @@ class GatedResidualFusion(nn.Module):
     """
 
     def __init__(self, small_model, s1: int, s2: int,
-                 d_large: int, d_small: int, mlp_dim: int):
+                 d_large: int, d_small: int, mlp_dim: int, bridge_depth: int = 1):
         super().__init__()
         # 输入/输出归一化(Qwen3 同款 RMSNorm):
         #   输入侧: h12(范数~150)先归一化到单位尺度,适配器不受残差流绝对量级影响
         #   输出侧: branch 归一化到 √d_large(≈50)量级,与 4B 残差流(范数~150)同量级再加回
         self.input_norm = nn.RMSNorm(d_large, eps=1e-6)
         self.output_norm = nn.RMSNorm(d_large, eps=1e-6)
-        self.adapter1 = GatedAdapter(d_large, d_small, mlp_dim)   # 4B 隐空间 → 0.6B 隐空间
-        self.adapter2 = GatedAdapter(d_small, d_large, mlp_dim)   # 0.6B 隐空间 → 4B 隐空间
+        self.adapter1 = GatedAdapter(d_large, d_small, mlp_dim, bridge_depth)
+        self.adapter2 = GatedAdapter(d_small, d_large, mlp_dim, bridge_depth)
         # 0.6B 的 1/3~2/3 层(冻结使用: 不更新参数,但梯度可穿过它回传)。
         # 用普通 list 而非 ModuleList: 这些层属于小模型本体,不应混入 fusion 的 state_dict
         self.small_layers = [small_model.model.layers[i] for i in range(s1, s2 + 1)]
@@ -269,13 +348,13 @@ class GatedResidualFusion(nn.Module):
         layer_types = getattr(sm.config, "layer_types", None)
         if layer_types is None:
             layer_types = ["full_attention"] * sm.config.num_hidden_layers
-        for j, layer in enumerate(sm.layers[self.s1:self.s2 + 1]):
-            mask = mask_map[layer_types[self.s1 + j]]
-            # 注意: transformers 5.x 的 Qwen3DecoderLayer.forward 直接返回张量(B,L,D),
-            # 不是元组, 不能加 [0](否则会切掉 batch 维)
-            h = layer(h, attention_mask=mask,
-                      position_embeddings=pos_emb, position_ids=pos_ids,
-                      past_key_values=None, use_cache=False)
+        if not self.bypass_small:
+            for j, layer in enumerate(sm.layers[self.s1:self.s2 + 1]):
+                mask = mask_map[layer_types[self.s1 + j]]
+                # transformers 5.x 的层直接返回张量，不能加 [0]。
+                h = layer(h, attention_mask=mask,
+                          position_embeddings=pos_emb, position_ids=pos_ids,
+                          past_key_values=None, use_cache=False)
         x = sm.norm(h)
         x = x.to(device=h.device, dtype=h.dtype)
         out = self.adapter2(x)
@@ -326,6 +405,7 @@ def attach_fusion(model_large, model_small, config: Config) -> GatedResidualFusi
         d_large=model_large.config.hidden_size,
         d_small=model_small.config.hidden_size,
         mlp_dim=config.fusion_mlp_dim,
+        bridge_depth=config.fusion_bridge_depth,
     )
     # 注意: 只搬适配器与门控到 4B 的设备+精度(bf16);不能对整个 fusion 调 .to() ——
     # small_layers 是 0.6B 模型本身的层对象,整体搬会挪走/毁掉小模型的参数位置
@@ -343,6 +423,7 @@ def attach_fusion(model_large, model_small, config: Config) -> GatedResidualFusi
     object.__setattr__(fusion, "small_model_ref", model_small.model)
     object.__setattr__(fusion, "s1", s1)
     object.__setattr__(fusion, "s2", s2)
+    object.__setattr__(fusion, "bypass_small", bool(config.fusion_bypass_small))
 
     state = {}
     # 训练诊断用(训练脚本通过这几个属性控制/读取钩子):
@@ -387,8 +468,10 @@ def save_fusion(fusion: GatedResidualFusion, path: str):
             "small_s1": int(getattr(fusion, "s1", -1)),
             "small_s2": int(getattr(fusion, "s2", -1)),
             "mlp_dim": int(fusion.adapter1.down.out_features),
+            "bridge_depth": 1 + len(fusion.adapter1.blocks),
             "d_large": int(fusion.adapter1.down.in_features),
             "d_small": int(fusion.adapter1.up.out_features),
+            "bypass_small": bool(getattr(fusion, "bypass_small", False)),
         },
     }
     torch.save(payload, path)
@@ -403,12 +486,19 @@ def load_fusion(fusion: GatedResidualFusion, path: str):
         meta = obj.get("meta", {})
         if meta:
             cur = (int(getattr(fusion, "s1", -1)), int(getattr(fusion, "s2", -1)),
-                   int(fusion.adapter1.down.out_features))
-            new = (meta.get("small_s1"), meta.get("small_s2"), meta.get("mlp_dim"))
-            if new[0] is not None and cur != (new[0], new[1], new[2]):
+                   int(fusion.adapter1.down.out_features),
+                   1 + len(fusion.adapter1.blocks))
+            new = (meta.get("small_s1"), meta.get("small_s2"), meta.get("mlp_dim"),
+                   meta.get("bridge_depth", 1))
+            if new[0] is not None and cur != new:
                 print(f"    [警告] 检查点层范围/维度与当前不符: "
-                      f"检查点 s1={new[0]} s2={new[1]} mlp={new[2]} "
-                      f"vs 当前 s1={cur[0]} s2={cur[1]} mlp={cur[2]}")
+                      f"检查点 s1={new[0]} s2={new[1]} mlp={new[2]} depth={new[3]} "
+                      f"vs 当前 s1={cur[0]} s2={cur[1]} mlp={cur[2]} depth={cur[3]}")
+            saved_bypass = meta.get("bypass_small")
+            current_bypass = bool(getattr(fusion, "bypass_small", False))
+            if saved_bypass is not None and bool(saved_bypass) != current_bypass:
+                raise ValueError("检查点 bypass_small 与当前配置不一致；"
+                                 "bridge-only 权重评测时请传 --bypass_small")
     else:
         sd = obj   # 旧版裸 state_dict
     fusion.load_state_dict(sd)

@@ -53,7 +53,36 @@ python core_training/main.py
 
 # 4. 基线评测（对照组）
 python test/test_baseline.py
+
+# 5. 任务感知接入位置搜索（分层候选 → ΔNLL → 多 seed 短训）
+bash scripts/run_task_aware_search.sh
+
+# 只做位置筛选，不启动短训和准确率评测
+bash scripts/run_selection_only.sh
+
+# 深 bridge / 小模型 LoRA / 标准 4B LoRA 三组实验
+bash scripts/run_capacity_lora_experiments.sh
+
+# 两阶段正式流程：GPU0 筛位置；GPU1 训练三组并做三段各 400 题评测
+SELECTION_GPU=0 EXPERIMENT_GPU=1 bash scripts/run_two_gpu_pipeline.sh
+
+# Windows + BES conda + 12GB GPU：串行验证筛选、三组训练及分层评测基本流程
+powershell -ExecutionPolicy Bypass -File scripts/run_local_smoke.ps1
 ```
+
+本地 smoke 默认只训练 1 条、评测每段 1 题，并使用窄 bridge 与 LoRA r=4；它用于发现
+依赖、显存、保存/重载和参数连接问题，输出准确率不具有统计意义。正式实验仍使用
+`run_capacity_lora_experiments.sh` 中的 bridge 4096 与大模型 LoRA r=64 配置。
+
+两阶段流程会先生成约 75% MATH、25% GSM8K 的训练/验证集；MATH 官方 train
+按 Level 1–5 分层切分，官方 test 只用于最终评测。可分别执行
+`STAGE=selection` 和 `STAGE=experiments`，第二阶段会自动读取第一阶段的最佳位置。
+正式脚本默认按 80GB GPU 使用 batch size 8、max length 1024、3 epochs、
+FlashAttention 2、生成长度 1024 和 seed 42。
+
+任务感知搜索的指标、预算和最终统计规则见
+[`TASK_AWARE_EXPERIMENT_PLAN.md`](TASK_AWARE_EXPERIMENT_PLAN.md)。筛选结果里的小模型片段统一表示为
+右开区间 `[a,b)`；兼容旧训练入口时，脚本会自动把它转换为 inclusive `--small_end=b-1`。
 
 ## 数据准备
 
