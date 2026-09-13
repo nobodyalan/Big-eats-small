@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "name": "math_majority_v2",
+  "path": "data/math_majority_all.jsonl",
+  "manifest": "data/math_majority_manifest.json",
+  "recipe": "metamath_math_majority_v2",
+  "split_policy": "train scripts reserve the final eval_samples records",
+  "train_records": 31997,
+  "validation_records": 1999,
+  "total_records": 33996,
+  "notes": "MATH-majority SFT data; official MATH test remains evaluation-only"
+}

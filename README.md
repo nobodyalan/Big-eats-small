@@ -14,6 +14,10 @@
 
 ```
 BES/
+├── configs/                # 可入 Git 的数据、模型与实验配置
+├── models/                 # 基础/训练模型（大文件，不入库）
+├── logs/                   # 运行日志与训练曲线（不入库）
+├── eval_results/           # 按方向/模型/方案保存的评测 JSON（不入库）
 ├── core_training/          # 核心架构与训练
 │   ├── main.py               # 融合架构 + 推理入口
 │   └── train_fusion.py       # 适配器训练脚本
@@ -59,6 +63,10 @@ python test/test_baseline.py
 # 5. 任务感知接入位置搜索（分层候选 → ΔNLL → 多 seed 短训）
 bash scripts/run_task_aware_search.sh
 
+# 从版本化配置启动实验；先用 --dry-run 检查命令
+python3 scripts/run_config.py \
+  configs/experiments/large_lora/qwen3_4b/r48/train_seed42_trial001.json --dry-run
+
 # 只做位置筛选，不启动短训和准确率评测
 bash scripts/run_selection_only.sh
 
@@ -74,6 +82,11 @@ SELECTION_GPU=0 EXPERIMENT_GPU=1 bash scripts/run_two_gpu_pipeline.sh
 # Windows + BES conda + 12GB GPU：串行验证筛选、三组训练及分层评测基本流程
 powershell -ExecutionPolicy Bypass -File scripts/run_local_smoke.ps1
 ```
+
+新实验不再以 `cache/` 作为唯一产物目录：配置进入 `configs/`，权重进入
+`models/trained/<direction>/<model>/<variant>/<seed>/<trial>/`，日志和准确率结果
+使用相同的语义分类路径。`cache/` 仅保留可重建的下载、位置搜索和临时文件。
+旧实验暂不自动移动，避免影响正在运行的进程和已有评测命令。
 
 本地 smoke 默认只训练 1 条、评测每段 1 题，并使用窄 bridge 与 LoRA r=4；它用于发现
 依赖、显存、保存/重载和参数连接问题，输出准确率不具有统计意义。正式实验仍使用

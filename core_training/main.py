@@ -104,7 +104,7 @@ def model_device(model) -> torch.device:
 
 
 def resolve_model_path(model_id: str, local_override: Optional[str]) -> str:
-    """优先使用完整的本地缓存，只有本地没有模型时才请求 ModelScope。"""
+    """优先使用项目 models/pretrained 或完整缓存，本地均无模型时再联网。"""
     if local_override:
         return local_override
 
@@ -117,13 +117,24 @@ def resolve_model_path(model_id: str, local_override: Optional[str]) -> str:
         )
         return any(os.path.isfile(os.path.join(path, name)) for name in weight_names)
 
+    # 仓库统一模型目录。既支持简短目录名，也支持按组织名嵌套或用 ``--`` 展平。
+    model_dir_name = model_id.replace("/", "--")
+    project_model_root = os.path.join(_ROOT, "models", "pretrained")
+    project_candidates = [
+        os.path.join(project_model_root, model_id),
+        os.path.join(project_model_root, model_id.rsplit("/", 1)[-1]),
+        os.path.join(project_model_root, model_dir_name),
+    ]
+    for path in project_candidates:
+        if is_complete_model_dir(path):
+            return path
+
     # ModelScope 新版缓存。snapshot_download 在离线环境仍可能先请求文件列表，
     # 因此要在调用它之前直接解析已经完整落盘的 snapshot。
     cache_root = os.environ.get(
         "MODELSCOPE_CACHE",
         os.path.join(os.path.expanduser("~"), ".cache", "modelscope"),
     )
-    model_dir_name = model_id.replace("/", "--")
     ms_candidates = [
         os.path.join(cache_root, "models", model_dir_name, "snapshots", "master"),
         os.path.join(cache_root, "hub", model_id),

@@ -7,6 +7,10 @@ venv/
 
 # ── 模型权重 / 训练产物(cache 里的 .pt 很大, 不入库) ──
 cache/
+models/
+
+# ── 运行日志（配置文件保留在 configs/，日志不入库） ─────
+logs/
 
 # ── 大数据集 / 训练数据(超过 GitHub 100MB 限制, 不入库) ──
 data/

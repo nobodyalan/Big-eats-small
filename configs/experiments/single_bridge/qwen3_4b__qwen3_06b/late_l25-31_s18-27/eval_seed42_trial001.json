@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "experiment_key": "single_bridge/qwen3_4b__qwen3_06b/late_l25-31_s18-27/seed42/trial_001",
+  "direction": "single_bridge",
+  "model_group": "qwen3_4b__qwen3_06b",
+  "variant": "late_l25-31_s18-27",
+  "trial": 1,
+  "name": "eval_late_bridge_seed42",
+  "program": "eval/run_segments_parallel.py",
+  "gpu": 0,
+  "env": {"PYTHONUNBUFFERED": "1"},
+  "args": {
+    "out_dir": "eval_results/single_bridge/qwen3_4b__qwen3_06b/late_l25-31_s18-27/seed42/trial_001",
+    "tag": "late_bridge_seed42_n200",
+    "quiet": true
+  },
+  "passthrough": [
+    "--limit", "200", "--seed", "42", "--math_lo", "1-3",
+    "--math_hi", "4-5", "--max_new", "1024",
+    "--attn_impl", "flash_attention_2", "--fusion_only",
+    "--bridge_depth", "1", "--bridge_mlp_dim", "4096",
+    "--large_start", "25", "--large_end", "31",
+    "--small_start", "18", "--small_end", "26",
+    "--ckpt", {
+      "first_existing": [
+        "models/trained/single_bridge/qwen3_4b__qwen3_06b/late_l25-31_s18-27/seed42/trial_001/adapter.pt.best_useful",
+        "models/trained/single_bridge/qwen3_4b__qwen3_06b/late_l25-31_s18-27/seed42/trial_001/adapter.pt.best",
+        "models/trained/single_bridge/qwen3_4b__qwen3_06b/late_l25-31_s18-27/seed42/trial_001/adapter.pt"
+      ]
+    }
+  ],
+  "required_paths": [
+    "data/.cache/math/MATH.zip",
+    "data/.cache/gsm8k_test.parquet"
+  ],
+  "required_any_paths": [[
+    "models/trained/single_bridge/qwen3_4b__qwen3_06b/late_l25-31_s18-27/seed42/trial_001/adapter.pt.best_useful",
+    "models/trained/single_bridge/qwen3_4b__qwen3_06b/late_l25-31_s18-27/seed42/trial_001/adapter.pt.best",
+    "models/trained/single_bridge/qwen3_4b__qwen3_06b/late_l25-31_s18-27/seed42/trial_001/adapter.pt"
+  ]],
+  "log_path": "logs/single_bridge/qwen3_4b__qwen3_06b/late_l25-31_s18-27/seed42/trial_001/eval.log",
+  "resolved_config_path": "eval_results/single_bridge/qwen3_4b__qwen3_06b/late_l25-31_s18-27/seed42/trial_001/resolved_config.json"
+}
