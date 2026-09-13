@@ -16,6 +16,7 @@ MATH test 划分评测: 融合 vs baseline 的最终答案准确率
 """
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -146,15 +147,17 @@ def judge_with_math_verify(runtime, generated_text: str, gold_answer: str):
         extraction_config = (latex_config, runtime["expr_config"]())
         parsed_gold = runtime["parse"](
             gold_text, extraction_config=extraction_config, raise_on_error=True)
+        # 对模型的无答案/畸形答案按官方默认语义返回空列表并计错，而不是把
+        # “模型答错”误报成评测程序崩溃。gold 仍开启异常传播，防止标准答案损坏。
         parsed_prediction = runtime["parse"](
-            generated_text, extraction_config=extraction_config, raise_on_error=True)
+            generated_text, extraction_config=extraction_config, raise_on_error=False)
         result["gold"] = [str(item) for item in parsed_gold]
         result["prediction"] = [str(item) for item in parsed_prediction]
         result["extracted"] = bool(parsed_prediction)
         if parsed_gold and parsed_prediction:
             # Math-Verify 的 verify 非对称，官方要求 gold 在前、prediction 在后。
             result["correct"] = bool(runtime["verify"](
-                parsed_gold, parsed_prediction, raise_on_error=True))
+                parsed_gold, parsed_prediction, raise_on_error=False))
     except Exception as exc:  # 单题解析失败不应终止几小时的整轮生成评测
         result["error"] = f"{type(exc).__name__}: {exc}"[:500]
     return result
@@ -267,7 +270,9 @@ def load_test_problems(zip_path: str, seed: int, limit: int, levels=None):
     """读 MATH test; levels 为 int 集合(如 {1,2,3})或 None=全部"""
     zf = zipfile.ZipFile(zip_path)
     prefix = "MATH/test/"
-    names = [n for n in zf.namelist() if n.startswith(prefix) and n.endswith(".json")]
+    names = sorted(
+        n for n in zf.namelist()
+        if n.startswith(prefix) and n.endswith(".json"))
     probs = []
     for name in names:
         with zf.open(name) as f:
@@ -277,6 +282,8 @@ def load_test_problems(zip_path: str, seed: int, limit: int, levels=None):
                 digits = "".join(ch for ch in lv if ch.isdigit())
                 if not digits or int(digits) not in levels:
                     continue
+            p = dict(p)
+            p["benchmark_id"] = name
             probs.append(p)
     rng = random.Random(seed)
     rng.shuffle(probs)       # 保持随机顺序(不要 sorted, 否则会按学科排序)
@@ -334,7 +341,12 @@ def load_gsm8k_test(seed: int, limit: int):
     t = pq.read_table(GSM8K_TEST_PATH)
     qs = t.column("question").to_pylist()
     ans = t.column("answer").to_pylist()
-    items = [{"problem": q, "answer": a} for q, a in zip(qs, ans)]
+    items = [{
+        "benchmark_id": "gsm8k_" + hashlib.sha1(
+            str(q).encode("utf-8")).hexdigest()[:12],
+        "problem": q,
+        "answer": a,
+    } for q, a in zip(qs, ans)]
     rng = random.Random(seed)
     rng.shuffle(items)
     if limit > 0:
@@ -434,6 +446,10 @@ def main():
                         help="在逐题 JSON 中保存模型完整生成文本，供格式和截断排查")
     parser.add_argument("--out_dir", default="eval_results")
     parser.add_argument("--tag", default="", help="输出文件名标签(并行多模型评测时用于区分)")
+    parser.add_argument("--result_path", default="",
+                        help="单 benchmark 的确定输出 JSON；供并行套件避免拿错旧文件")
+    parser.add_argument("--suite_run_id", default="",
+                        help="并行套件本轮标识；写入结果以防误读上一次残留文件")
     args = parser.parse_args()
     if args.fusion_only and args.baseline_only:
         parser.error("--fusion_only 与 --baseline_only 不能同时使用")
@@ -443,6 +459,10 @@ def main():
         parser.error("--segment_only 仅可与 --bench segments 一起使用")
     if args.omni_limit_per_level < 0:
         parser.error("--omni_limit_per_level 必须 >= 0")
+    if args.result_path and (
+            args.bench == "both"
+            or (args.bench == "segments" and args.segment_only == "all")):
+        parser.error("--result_path 只支持恰好一个 benchmark")
 
     math_verify_runtime = None
     if args.math_judge == "both":
@@ -685,7 +705,18 @@ def main():
             print(" | ".join(parts), flush=True)
 
         n_total = len(results)
-        summary = {"bench": name, "n": n_total}
+        # 不只哈希题号，也纳入题面和标准答案。这样即使两个服务器上的
+        # 数据文件路径/题号相同但内容版本不同，汇总检查仍能发现不一致。
+        question_fingerprint = [
+            {"id": row["id"], "problem": row["problem"], "gold": row["gold"]}
+            for row in results
+        ]
+        question_set_sha256 = hashlib.sha256(json.dumps(
+            question_fingerprint, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        summary = {"bench": name, "n": n_total,
+                   "question_set_sha256": question_set_sha256}
         print("=" * 62)
         for label in ("baseline", "fusion", "lora"):
             key = f"{label}_correct"
@@ -769,11 +800,15 @@ def main():
         all_summaries[name] = summary
 
         tag = f"_{args.tag}" if args.tag else ""
-        path = os.path.join(args.out_dir,
-                            f"eval_{name.lower()}{tag}_{time.strftime('%Y%m%d_%H%M%S')}.json")
-        with open(path, "w", encoding="utf-8") as f:
+        path = (args.result_path or os.path.join(
+            args.out_dir,
+            f"eval_{name.lower()}{tag}_{time.strftime('%Y%m%d_%H%M%S')}.json"))
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        temporary_path = f"{path}.tmp.{os.getpid()}"
+        with open(temporary_path, "w", encoding="utf-8") as f:
             json.dump({"ckpt": args.ckpt, "small_lora_ckpt": args.small_lora_ckpt,
                        "lora_ckpt": args.lora_ckpt,
+                       "suite_run_id": args.suite_run_id,
                        "small_start": args.small_start, "small_end": args.small_end,
                        "seed": args.seed, "segment_only": args.segment_only,
                        "omni_path": args.omni_path,
@@ -784,9 +819,11 @@ def main():
                        "math_verify_version": (
                            math_verify_runtime["version"]
                            if math_verify_runtime is not None else None),
+                       "question_set_sha256": question_set_sha256,
                        "save_raw_output": args.save_raw_output,
                        "summary": summary,
                        "results": results}, f, ensure_ascii=False, indent=2)
+        os.replace(temporary_path, path)
         print(f"结果已保存: {path}")
 
     if len(benches) > 1:

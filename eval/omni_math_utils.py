@@ -124,12 +124,14 @@ def summarize_by_difficulty(results):
         rows = groups[level]
         part = {"n": len(rows)}
         for label in ("baseline", "fusion", "lora"):
-            key = f"{label}_correct"
-            present = [row[key] for row in rows if key in row]
-            if present:
-                correct = sum(bool(x) for x in present)
-                part[f"{label}_correct"] = correct
-                part[f"{label}_acc"] = round(correct / len(present), 4)
+            for suffix in ("correct", "math_verify_correct"):
+                key = f"{label}_{suffix}"
+                present = [row[key] for row in rows if key in row]
+                if present:
+                    correct = sum(bool(x) for x in present)
+                    part[key] = correct
+                    part[key.removesuffix("correct") + "acc"] = round(
+                        correct / len(present), 4)
         summary[str(level)] = part
     return summary
 
