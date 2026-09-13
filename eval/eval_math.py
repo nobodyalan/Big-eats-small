@@ -12,6 +12,7 @@ MATH test 划分评测: 融合 vs baseline 的最终答案准确率
   python eval/eval_math.py --ckpt cache/fusion_adapter.pt --limit 200          # 随机 200 题
   python eval/eval_math.py --ckpt cache/fusion_adapter.pt --limit 0            # 全量 5000 题
   python eval/eval_math.py --ckpt cache/fusion_adapter.pt --limit 200 --fusion_only
+  python eval/eval_math.py --bench segments --segment_only math_hi --limit 200 # 只跑高难档
 """
 
 import argparse
@@ -308,6 +309,12 @@ def main():
                         help="segments 模式下 MATH 低级区间(如 1-3 / 1,2,3)")
     parser.add_argument("--math_hi", default="4-5",
                         help="segments 模式下 MATH 高级区间(如 4-5 / 5)")
+    parser.add_argument(
+        "--segment_only", default="all",
+        choices=["all", "gsm8k", "math_lo", "math_hi"],
+        help=("segments 模式下只运行指定档位；all=依次运行三档。"
+              "可分别启动三个进程以并行评测同一模型"),
+    )
     parser.add_argument("--fusion_only", action="store_true", help="只测 fusion, 跳过 baseline")
     parser.add_argument("--baseline_only", action="store_true",
                         help="只测纯 4B baseline；不加载小模型、bridge 或 LoRA")
@@ -318,6 +325,8 @@ def main():
         parser.error("--fusion_only 与 --baseline_only 不能同时使用")
     if args.baseline_only and (args.ckpt or args.small_lora_ckpt or args.lora_ckpt):
         parser.error("--baseline_only 不应同时传入实验 checkpoint")
+    if args.segment_only != "all" and args.bench != "segments":
+        parser.error("--segment_only 仅可与 --bench segments 一起使用")
 
     # ── 选择 benchmark(数据 + 判分函数) ──
     benches = []
@@ -337,20 +346,26 @@ def main():
                         lambda r: str(r.get("answer", "")).strip(),
                         extract_pred_gsm8k, gsm8k_equal))
     if args.bench == "segments":
-        # 三段: GSM8K + MATH 低级 + MATH 高级(同一 seed → 各段题目一致)
-        ensure_zip(args.zip)
-        lo, hi = parse_levels(args.math_lo), parse_levels(args.math_hi)
-        benches.append(("GSM8K", load_gsm8k_test(args.seed, args.limit),
-                        lambda r: extract_gold_gsm8k(r.get("answer", "")),
-                        extract_pred_gsm8k, gsm8k_equal))
-        benches.append((f"MATH_lo{args.math_lo}",
-                        load_test_problems(args.zip, args.seed, args.limit, levels=lo),
-                        lambda r: extract_boxed(r.get("solution", "")),
-                        extract_boxed, answers_equal))
-        benches.append((f"MATH_hi{args.math_hi}",
-                        load_test_problems(args.zip, args.seed, args.limit, levels=hi),
-                        lambda r: extract_boxed(r.get("solution", "")),
-                        extract_boxed, answers_equal))
+        # 三段可顺序运行，也可用 --segment_only 拆成独立进程并行运行。
+        selected = args.segment_only
+        if selected in ("all", "gsm8k"):
+            benches.append(("GSM8K", load_gsm8k_test(args.seed, args.limit),
+                            lambda r: extract_gold_gsm8k(r.get("answer", "")),
+                            extract_pred_gsm8k, gsm8k_equal))
+        if selected in ("all", "math_lo"):
+            ensure_zip(args.zip)
+            lo = parse_levels(args.math_lo)
+            benches.append((f"MATH_lo{args.math_lo}",
+                            load_test_problems(args.zip, args.seed, args.limit, levels=lo),
+                            lambda r: extract_boxed(r.get("solution", "")),
+                            extract_boxed, answers_equal))
+        if selected in ("all", "math_hi"):
+            ensure_zip(args.zip)
+            hi = parse_levels(args.math_hi)
+            benches.append((f"MATH_hi{args.math_hi}",
+                            load_test_problems(args.zip, args.seed, args.limit, levels=hi),
+                            lambda r: extract_boxed(r.get("solution", "")),
+                            extract_boxed, answers_equal))
 
     # ── 加载模型(旁路 / LoRA / 两者并行) ──
     cfg = Config()
@@ -530,7 +545,8 @@ def main():
             json.dump({"ckpt": args.ckpt, "small_lora_ckpt": args.small_lora_ckpt,
                        "lora_ckpt": args.lora_ckpt,
                        "small_start": args.small_start, "small_end": args.small_end,
-                       "seed": args.seed, "summary": summary,
+                       "seed": args.seed, "segment_only": args.segment_only,
+                       "summary": summary,
                        "results": results}, f, ensure_ascii=False, indent=2)
         print(f"结果已保存: {path}")
 
