@@ -65,7 +65,7 @@ bash scripts/run_task_aware_search.sh
 
 # 从版本化配置启动实验；先用 --dry-run 检查命令
 python3 scripts/run_config.py \
-  configs/experiments/large_lora/qwen3_4b/r48/train_seed42_trial001.json --dry-run
+  configs/experiments/large_lora/qwen3_4b/r48/train_seed42.json --dry-run
 
 # 只做位置筛选，不启动短训和准确率评测
 bash scripts/run_selection_only.sh
@@ -84,7 +84,7 @@ powershell -ExecutionPolicy Bypass -File scripts/run_local_smoke.ps1
 ```
 
 新实验不再以 `cache/` 作为唯一产物目录：配置进入 `configs/`，权重进入
-`models/trained/<direction>/<model>/<variant>/<seed>/<trial>/`，日志和准确率结果
+`models/trained/<direction>/<model>/<variant>/<seed>/`，日志和准确率结果
 使用相同的语义分类路径。`cache/` 仅保留可重建的下载、位置搜索和临时文件。
 旧实验暂不自动移动，避免影响正在运行的进程和已有评测命令。
 

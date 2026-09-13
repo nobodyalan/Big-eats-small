@@ -6,7 +6,7 @@
 ```json
 {
   "schema_version": 1,
-  "experiment_key": "direction/model/variant/seed42/trial_001",
+  "experiment_key": "direction/model/variant/seed42",
   "name": "human_readable_task",
   "program": "core_training/train_fusion.py",
   "gpu": 0,
@@ -14,19 +14,19 @@
   "args": {"epochs": 3, "grad_checkpoint": 1},
   "passthrough": [],
   "required_paths": ["data/example.jsonl"],
-  "log_path": "logs/<direction>/<model>/<variant>/seed42/trial_001/train.log",
-  "resolved_config_path": "models/trained/<direction>/<model>/<variant>/seed42/trial_001/resolved_config.json"
+  "log_path": "logs/<direction>/<model>/<variant>/seed42/train.log",
+  "resolved_config_path": "models/trained/<direction>/<model>/<variant>/seed42/resolved_config.json"
 }
 ```
 
 目录和 `experiment_key` 统一采用：
 
 ```text
-实验方向 / 模型或模型组合 / 方案 / seed / trial
+实验方向 / 模型或模型组合 / 方案 / seed
 ```
 
-`trial_001` 用于防止同一配置重复运行时覆盖，不承担实验分类作用。启动器仍兼容
-带 `run_id` 的旧配置，但新配置不再使用它。
+启动器仍兼容带 `run_id` 的旧配置，但新配置不再使用它。相同 seed 的故障重跑不
+算独立实验；真正的统计重复应创建新的 seed。
 
 某个 CLI 参数需要按优先级选择已有 checkpoint 时，可写成：
 

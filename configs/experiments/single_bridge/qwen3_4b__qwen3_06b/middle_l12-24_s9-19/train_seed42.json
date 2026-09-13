@@ -1,14 +1,13 @@
 {
   "schema_version": 1,
-  "experiment_key": "single_bridge/qwen3_4b__qwen3_06b/late_l25-31_s18-27/seed42/trial_001",
+  "experiment_key": "single_bridge/qwen3_4b__qwen3_06b/middle_l12-24_s9-19/seed42",
   "direction": "single_bridge",
   "model_group": "qwen3_4b__qwen3_06b",
-  "variant": "late_l25-31_s18-27",
-  "trial": 1,
-  "name": "late_bridge_seed42",
-  "description": "Frozen 4B/0.6B, late single bridge: large 25->31, small layers [18,27)",
+  "variant": "middle_l12-24_s9-19",
+  "name": "middle_bridge_seed42",
+  "description": "Frozen 4B/0.6B, middle single bridge: large 12->24, small layers [9,19)",
   "program": "core_training/train_fusion.py",
-  "gpu": 3,
+  "gpu": 2,
   "env": {"PYTHONUNBUFFERED": "1"},
   "args": {
     "data": "data/math_majority_all.jsonl",
@@ -16,10 +15,10 @@
     "epochs": 3,
     "batch_size": 8,
     "max_len": 1536,
-    "large_start": 25,
-    "large_end": 31,
-    "small_start": 18,
-    "small_end": 26,
+    "large_start": 12,
+    "large_end": 24,
+    "small_start": 9,
+    "small_end": 18,
     "bridge_depth": 1,
     "bridge_mlp_dim": 4096,
     "small_lora_r": 0,
@@ -44,10 +43,10 @@
     "log_every": 10,
     "patience": 0,
     "seed": 42,
-    "out": "models/trained/single_bridge/qwen3_4b__qwen3_06b/late_l25-31_s18-27/seed42/trial_001/adapter.pt",
-    "plot": "logs/single_bridge/qwen3_4b__qwen3_06b/late_l25-31_s18-27/seed42/trial_001/train_loss.png"
+    "out": "models/trained/single_bridge/qwen3_4b__qwen3_06b/middle_l12-24_s9-19/seed42/adapter.pt",
+    "plot": "logs/single_bridge/qwen3_4b__qwen3_06b/middle_l12-24_s9-19/seed42/train_loss.png"
   },
   "required_paths": ["data/math_majority_all.jsonl"],
-  "log_path": "logs/single_bridge/qwen3_4b__qwen3_06b/late_l25-31_s18-27/seed42/trial_001/train.log",
-  "resolved_config_path": "models/trained/single_bridge/qwen3_4b__qwen3_06b/late_l25-31_s18-27/seed42/trial_001/resolved_config.json"
+  "log_path": "logs/single_bridge/qwen3_4b__qwen3_06b/middle_l12-24_s9-19/seed42/train.log",
+  "resolved_config_path": "models/trained/single_bridge/qwen3_4b__qwen3_06b/middle_l12-24_s9-19/seed42/resolved_config.json"
 }

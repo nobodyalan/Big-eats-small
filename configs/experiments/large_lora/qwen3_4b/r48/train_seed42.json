@@ -1,10 +1,9 @@
 {
   "schema_version": 1,
-  "experiment_key": "large_lora/qwen3_4b/r48/seed42/trial_001",
+  "experiment_key": "large_lora/qwen3_4b/r48/seed42",
   "direction": "large_lora",
   "model_group": "qwen3_4b",
   "variant": "r48",
-  "trial": 1,
   "name": "large_lora_r48_seed42",
   "description": "Qwen3-4B full attention+MLP LoRA baseline, rank 48",
   "program": "core_training/train_lora.py",
@@ -33,10 +32,10 @@
     "log_every": 10,
     "patience": 0,
     "seed": 42,
-    "out": "models/trained/large_lora/qwen3_4b/r48/seed42/trial_001/adapter",
-    "plot": "logs/large_lora/qwen3_4b/r48/seed42/trial_001/train_loss.png"
+    "out": "models/trained/large_lora/qwen3_4b/r48/seed42/adapter",
+    "plot": "logs/large_lora/qwen3_4b/r48/seed42/train_loss.png"
   },
   "required_paths": ["data/math_majority_all.jsonl"],
-  "log_path": "logs/large_lora/qwen3_4b/r48/seed42/trial_001/train.log",
-  "resolved_config_path": "models/trained/large_lora/qwen3_4b/r48/seed42/trial_001/resolved_config.json"
+  "log_path": "logs/large_lora/qwen3_4b/r48/seed42/train.log",
+  "resolved_config_path": "models/trained/large_lora/qwen3_4b/r48/seed42/resolved_config.json"
 }

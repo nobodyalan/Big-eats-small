@@ -15,17 +15,17 @@ configs/
 
 models/
 ├── pretrained/               # 可选的本地基础模型/软链接
-└── trained/<direction>/<model>/<variant>/<seed>/<trial>/
+└── trained/<direction>/<model>/<variant>/<seed>/
 
-logs/<direction>/<model>/<variant>/<seed>/<trial>/
-eval_results/<direction>/<model>/<variant>/<seed>/<trial>/
+logs/<direction>/<model>/<variant>/<seed>/
+eval_results/<direction>/<model>/<variant>/<seed>/
 cache/                        # 可重建的下载、隐状态、搜索和临时缓存
 ```
 
-分类顺序固定为“实验方向 / 模型或模型组合 / 方案 / seed / trial”。
-`experiment_key` 使用相同的语义路径，因此不需要记忆日期型 `run_id`。同一配置
-再次运行时递增 `trial_001`，防止覆盖。不要为单次实验新增 shell 脚本；复制对应
-JSON 配置并修改方案、seed 或 trial 即可。
+分类顺序固定为“实验方向 / 模型或模型组合 / 方案 / seed”。
+`experiment_key` 使用相同的语义路径，因此不需要记忆日期型 `run_id`。不要为
+单次实验新增 shell 脚本；复制对应 JSON 配置并修改方案或 seed 即可。完全相同的
+配置因故障重跑时沿用同一目录；评测 JSON 自带时间戳，不会互相覆盖。
 
 ## 运行
 
@@ -33,7 +33,7 @@ JSON 配置并修改方案、seed 或 trial 即可。
 
 ```bash
 python3 scripts/run_config.py \
-  configs/experiments/large_lora/qwen3_4b/r48/train_seed42_trial001.json \
+  configs/experiments/large_lora/qwen3_4b/r48/train_seed42.json \
   --dry-run
 ```
 
@@ -41,7 +41,7 @@ python3 scripts/run_config.py \
 
 ```bash
 nohup python3 scripts/run_config.py \
-  configs/experiments/large_lora/qwen3_4b/r48/train_seed42_trial001.json \
+  configs/experiments/large_lora/qwen3_4b/r48/train_seed42.json \
   > /dev/null 2>&1 &
 echo $!
 ```

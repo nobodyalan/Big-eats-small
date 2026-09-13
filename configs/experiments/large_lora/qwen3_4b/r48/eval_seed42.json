@@ -1,16 +1,15 @@
 {
   "schema_version": 1,
-  "experiment_key": "large_lora/qwen3_4b/r48/seed42/trial_001",
+  "experiment_key": "large_lora/qwen3_4b/r48/seed42",
   "direction": "large_lora",
   "model_group": "qwen3_4b",
   "variant": "r48",
-  "trial": 1,
   "name": "eval_large_lora_r48_seed42",
   "program": "eval/run_segments_parallel.py",
   "gpu": 0,
   "env": {"PYTHONUNBUFFERED": "1"},
   "args": {
-    "out_dir": "eval_results/large_lora/qwen3_4b/r48/seed42/trial_001",
+    "out_dir": "eval_results/large_lora/qwen3_4b/r48/seed42",
     "tag": "large_lora_r48_seed42_n200",
     "quiet": true
   },
@@ -20,8 +19,8 @@
     "--attn_impl", "flash_attention_2", "--fusion_only",
     "--lora_ckpt", {
       "first_existing": [
-        "models/trained/large_lora/qwen3_4b/r48/seed42/trial_001/adapter.best",
-        "models/trained/large_lora/qwen3_4b/r48/seed42/trial_001/adapter"
+        "models/trained/large_lora/qwen3_4b/r48/seed42/adapter.best",
+        "models/trained/large_lora/qwen3_4b/r48/seed42/adapter"
       ]
     }
   ],
@@ -30,9 +29,9 @@
     "data/.cache/gsm8k_test.parquet"
   ],
   "required_any_paths": [[
-    "models/trained/large_lora/qwen3_4b/r48/seed42/trial_001/adapter.best",
-    "models/trained/large_lora/qwen3_4b/r48/seed42/trial_001/adapter"
+    "models/trained/large_lora/qwen3_4b/r48/seed42/adapter.best",
+    "models/trained/large_lora/qwen3_4b/r48/seed42/adapter"
   ]],
-  "log_path": "logs/large_lora/qwen3_4b/r48/seed42/trial_001/eval.log",
-  "resolved_config_path": "eval_results/large_lora/qwen3_4b/r48/seed42/trial_001/resolved_config.json"
+  "log_path": "logs/large_lora/qwen3_4b/r48/seed42/eval.log",
+  "resolved_config_path": "eval_results/large_lora/qwen3_4b/r48/seed42/resolved_config.json"
 }
