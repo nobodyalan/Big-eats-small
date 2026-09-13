@@ -1,0 +1,4 @@
+# Math answer extraction/equivalence. 4.9.3 is compatible with the server's
+# inherited hydra-core/omegaconf environment and is supported by Math-Verify.
+math-verify==0.9.0
+antlr4-python3-runtime==4.9.3

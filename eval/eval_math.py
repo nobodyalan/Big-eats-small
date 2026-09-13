@@ -23,6 +23,7 @@ import re
 import sys
 import time
 import zipfile
+from importlib.metadata import PackageNotFoundError, version as package_version
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -66,6 +67,97 @@ def extract_boxed(text: str):
             if depth == 0:
                 return text[i + 1:j]
     return None
+
+
+def extract_math_marker_answer(text: str):
+    """MATH 格式诊断：boxed 缺失时，仅从明确的最终答案标记后提取。
+
+    该函数不替代官方严格的 ``\\boxed{...}`` 判分，只用于区分“数学答案错误”与
+    “答案正确但沿用了 MetaMathQA 的 ``The answer is:`` / ``####`` 格式”。
+    为避免把推理过程中的最后一个数字误当答案，这里不做任意数字兜底。
+    """
+    boxed = extract_boxed(text)
+    if boxed is not None:
+        return boxed
+    if not text:
+        return None
+
+    matches = []
+    patterns = (
+        r"####\s*([^\r\n]+)",
+        r"(?:the\s+)?(?:final\s+)?answer\s*(?:is\s*:|is|:)\s*([^\r\n]+)",
+    )
+    for pattern in patterns:
+        matches.extend(re.finditer(pattern, text, flags=re.IGNORECASE))
+    if not matches:
+        return None
+
+    match = max(matches, key=lambda item: item.start())
+    candidate = match.group(1).strip()
+    # 常见输出是 ``The answer is: $...$.``；优先保留最后一个行内数学块。
+    inline_math = re.findall(r"(?<!\\)\$(.+?)(?<!\\)\$", candidate)
+    if inline_math:
+        candidate = inline_math[-1].strip()
+    if candidate.startswith(r"\(") and candidate.endswith(r"\)"):
+        candidate = candidate[2:-2].strip()
+    candidate = candidate.rstrip().rstrip(".。;,；")
+    return candidate or None
+
+
+def load_math_verify_runtime():
+    """按需加载 Math-Verify；未启用时不增加基础评测依赖。"""
+    try:
+        from math_verify import parse, verify
+        from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
+    except ImportError as exc:
+        raise RuntimeError(
+            "启用了 --math_judge both，但当前 Python 缺少 math-verify；"
+            "请使用安装了 math-verify 的评测 venv") from exc
+    try:
+        installed_version = package_version("math-verify")
+    except PackageNotFoundError:
+        installed_version = "unknown"
+    return {
+        "parse": parse,
+        "verify": verify,
+        "expr_config": ExprExtractionConfig,
+        "latex_config": LatexExtractionConfig,
+        "version": installed_version,
+    }
+
+
+def judge_with_math_verify(runtime, generated_text: str, gold_answer: str):
+    """用 Math-Verify 对完整模型输出判分，并返回可 JSON 序列化的诊断。"""
+    result = {
+        "correct": False,
+        "extracted": False,
+        "prediction": [],
+        "gold": [],
+        "error": None,
+    }
+    if gold_answer is None or not str(gold_answer).strip():
+        result["error"] = "missing gold answer"
+        return result
+    try:
+        # MATH 的 gold 已由官方 solution 中的 boxed 内容提取；重新包进 boxed，
+        # 能让分数、集合、区间等 LaTeX 结构按明确答案而非普通文本解析。
+        gold_text = rf"\boxed{{{gold_answer}}}"
+        latex_config = runtime["latex_config"](boxed_match_priority=0)
+        extraction_config = (latex_config, runtime["expr_config"]())
+        parsed_gold = runtime["parse"](
+            gold_text, extraction_config=extraction_config, raise_on_error=True)
+        parsed_prediction = runtime["parse"](
+            generated_text, extraction_config=extraction_config, raise_on_error=True)
+        result["gold"] = [str(item) for item in parsed_gold]
+        result["prediction"] = [str(item) for item in parsed_prediction]
+        result["extracted"] = bool(parsed_prediction)
+        if parsed_gold and parsed_prediction:
+            # Math-Verify 的 verify 非对称，官方要求 gold 在前、prediction 在后。
+            result["correct"] = bool(runtime["verify"](
+                parsed_gold, parsed_prediction, raise_on_error=True))
+    except Exception as exc:  # 单题解析失败不应终止几小时的整轮生成评测
+        result["error"] = f"{type(exc).__name__}: {exc}"[:500]
+    return result
 
 
 def normalize_answer(s: str) -> str:
@@ -331,6 +423,15 @@ def main():
     parser.add_argument("--fusion_only", action="store_true", help="只测 fusion, 跳过 baseline")
     parser.add_argument("--baseline_only", action="store_true",
                         help="只测纯 4B baseline；不加载小模型、bridge 或 LoRA")
+    parser.add_argument("--diagnose_math_format", action="store_true",
+                        help=("保留严格 boxed 指标，并额外报告 The answer is/#### "
+                              "标记兜底的诊断指标"))
+    parser.add_argument("--math_judge", choices=["legacy", "both"],
+                        default="legacy",
+                        help=("MATH 判分器：legacy=原严格 boxed；both=同时报告严格 "
+                              "boxed 与 Math-Verify（推荐）"))
+    parser.add_argument("--save_raw_output", action="store_true",
+                        help="在逐题 JSON 中保存模型完整生成文本，供格式和截断排查")
     parser.add_argument("--out_dir", default="eval_results")
     parser.add_argument("--tag", default="", help="输出文件名标签(并行多模型评测时用于区分)")
     args = parser.parse_args()
@@ -342,6 +443,15 @@ def main():
         parser.error("--segment_only 仅可与 --bench segments 一起使用")
     if args.omni_limit_per_level < 0:
         parser.error("--omni_limit_per_level 必须 >= 0")
+
+    math_verify_runtime = None
+    if args.math_judge == "both":
+        try:
+            math_verify_runtime = load_math_verify_runtime()
+        except RuntimeError as exc:
+            raise SystemExit(f"[错误] {exc}") from exc
+        print(f"Math-Verify 已启用: version={math_verify_runtime['version']} | "
+              f"mode={args.math_judge}")
 
     # ── 选择 benchmark(数据 + 判分函数) ──
     benches = []
@@ -501,6 +611,28 @@ def main():
             prompt = math_prompt(problem)
             rec = {"id": r.get("benchmark_id", i),
                    "problem": problem, "gold": gold}
+            math_strict = pred_fn is extract_boxed
+
+            def record_prediction(label, generated_text):
+                answer = pred_fn(generated_text)
+                rec[f"{label}_pred"] = answer
+                rec[f"{label}_correct"] = score_fn(answer, gold)
+                if args.save_raw_output:
+                    rec[f"{label}_text"] = generated_text
+                if args.diagnose_math_format and math_strict:
+                    relaxed = extract_math_marker_answer(generated_text)
+                    rec[f"{label}_relaxed_pred"] = relaxed
+                    rec[f"{label}_relaxed_correct"] = score_fn(relaxed, gold)
+                if math_verify_runtime is not None and math_strict:
+                    judged = judge_with_math_verify(
+                        math_verify_runtime, generated_text, gold)
+                    rec[f"{label}_math_verify_correct"] = judged["correct"]
+                    rec[f"{label}_math_verify_extracted"] = judged["extracted"]
+                    rec[f"{label}_math_verify_pred"] = judged["prediction"]
+                    rec[f"{label}_math_verify_gold"] = judged["gold"]
+                    if judged["error"] is not None:
+                        rec[f"{label}_math_verify_error"] = judged["error"]
+
             # Omni-MATH 的分层信息进入逐题结果，供难度选择与领域诊断使用。
             for field in ("difficulty", "difficulty_band", "domain", "source"):
                 if field in r:
@@ -521,25 +653,19 @@ def main():
                     # generate 抛异常也要恢复为开启, 防状态残留污染后续结果
                     set_fusion(True)
                     set_lora(True)
-                ans_base = pred_fn(pred_base)
-                rec["baseline_pred"] = ans_base
-                rec["baseline_correct"] = score_fn(ans_base, gold)
+                record_prediction("baseline", pred_base)
 
             # ② 旁路开
             if large_f is not None:
                 set_fusion(True)
                 pred_f = generate(large_f, tokenizer, prompt, args.max_new)
-                ans_f = pred_fn(pred_f)
-                rec["fusion_pred"] = ans_f
-                rec["fusion_correct"] = score_fn(ans_f, gold)
+                record_prediction("fusion", pred_f)
 
             # ③ LoRA 开
             if large_l is not None:
                 set_lora(True)
                 pred_l = generate(large_l, tokenizer, prompt, args.max_new)
-                ans_l = pred_fn(pred_l)
-                rec["lora_pred"] = ans_l
-                rec["lora_correct"] = score_fn(ans_l, gold)
+                record_prediction("lora", pred_l)
 
             results.append(rec)
             parts = [f"[{name} {i}/{n}]"]
@@ -549,6 +675,10 @@ def main():
             if large_l is not None:
                 acc_l = sum(1 for x in results if x.get("lora_correct")) / i
                 parts.append(f"lora={acc_l:.3f}")
+                if "lora_math_verify_correct" in rec:
+                    acc_l_mv = sum(
+                        1 for x in results if x.get("lora_math_verify_correct")) / i
+                    parts.append(f"lora_math_verify={acc_l_mv:.3f}")
             if not args.fusion_only:
                 acc_b = sum(1 for x in results if x.get("baseline_correct")) / i
                 parts.append(f"baseline={acc_b:.3f}")
@@ -564,6 +694,60 @@ def main():
                 summary[key] = c
                 summary[f"{label}_acc"] = round(c / n_total, 4) if n_total else 0
                 print(f"[{name}] {label} 准确率: {summary[f'{label}_acc']:.2%} ({c}/{n_total})")
+                pred_key = f"{label}_pred"
+                extracted = sum(1 for x in results if x.get(pred_key) is not None)
+                summary[f"{label}_extract_rate"] = round(
+                    extracted / n_total, 4) if n_total else 0
+                print(f"[{name}] {label} 严格答案提取率: "
+                      f"{summary[f'{label}_extract_rate']:.2%} ({extracted}/{n_total})")
+                relaxed_key = f"{label}_relaxed_correct"
+                if any(relaxed_key in x for x in results):
+                    relaxed_correct = sum(1 for x in results if x.get(relaxed_key))
+                    recovered = sum(
+                        1 for x in results
+                        if x.get(relaxed_key) and not x.get(key))
+                    fallback_used = sum(
+                        1 for x in results
+                        if x.get(pred_key) is None
+                        and x.get(f"{label}_relaxed_pred") is not None)
+                    summary[relaxed_key] = relaxed_correct
+                    summary[f"{label}_relaxed_acc"] = round(
+                        relaxed_correct / n_total, 4) if n_total else 0
+                    summary[f"{label}_format_recovered"] = recovered
+                    summary[f"{label}_marker_fallback_used"] = fallback_used
+                    print(f"[{name}] {label} 格式诊断准确率: "
+                          f"{summary[f'{label}_relaxed_acc']:.2%} "
+                          f"({relaxed_correct}/{n_total}) | 格式挽回 {recovered} 题 | "
+                          f"标记兜底触发 {fallback_used} 题")
+                math_verify_key = f"{label}_math_verify_correct"
+                if any(math_verify_key in x for x in results):
+                    mv_correct = sum(1 for x in results if x.get(math_verify_key))
+                    mv_extracted = sum(
+                        1 for x in results
+                        if x.get(f"{label}_math_verify_extracted"))
+                    mv_errors = sum(
+                        1 for x in results
+                        if x.get(f"{label}_math_verify_error") is not None)
+                    mv_recovered = sum(
+                        1 for x in results
+                        if x.get(math_verify_key) and not x.get(key))
+                    legacy_only = sum(
+                        1 for x in results
+                        if x.get(key) and not x.get(math_verify_key))
+                    summary[math_verify_key] = mv_correct
+                    summary[f"{label}_math_verify_acc"] = round(
+                        mv_correct / n_total, 4) if n_total else 0
+                    summary[f"{label}_math_verify_extract_rate"] = round(
+                        mv_extracted / n_total, 4) if n_total else 0
+                    summary[f"{label}_math_verify_errors"] = mv_errors
+                    summary[f"{label}_math_verify_recovered"] = mv_recovered
+                    summary[f"{label}_legacy_only_correct"] = legacy_only
+                    print(f"[{name}] {label} Math-Verify 准确率: "
+                          f"{summary[f'{label}_math_verify_acc']:.2%} "
+                          f"({mv_correct}/{n_total}) | 提取率 "
+                          f"{summary[f'{label}_math_verify_extract_rate']:.2%} | "
+                          f"较 strict 挽回 {mv_recovered} 题 | "
+                          f"strict-only {legacy_only} 题 | 解析异常 {mv_errors} 题")
         if name.startswith("OMNI_MATH"):
             summary["by_difficulty"] = summarize_by_difficulty(results)
             print(f"[{name}] 分难度结果:")
@@ -595,6 +779,12 @@ def main():
                        "omni_path": args.omni_path,
                        "omni_levels": args.omni_levels,
                        "omni_limit_per_level": args.omni_limit_per_level,
+                       "diagnose_math_format": args.diagnose_math_format,
+                       "math_judge": args.math_judge,
+                       "math_verify_version": (
+                           math_verify_runtime["version"]
+                           if math_verify_runtime is not None else None),
+                       "save_raw_output": args.save_raw_output,
                        "summary": summary,
                        "results": results}, f, ensure_ascii=False, indent=2)
         print(f"结果已保存: {path}")

@@ -10,12 +10,13 @@
   "env": {"PYTHONUNBUFFERED": "1"},
   "args": {
     "out_dir": "eval_results/large_lora/qwen3_4b/r48/seed42",
-    "tag": "large_lora_r48_seed42_n200",
+    "tag": "large_lora_r48_seed42_n200_mathverify",
     "quiet": true
   },
   "passthrough": [
     "--limit", "200", "--seed", "42", "--math_lo", "1-3",
     "--math_hi", "4-5", "--max_new", "1024",
+    "--math_judge", "both", "--save_raw_output",
     "--attn_impl", "flash_attention_2", "--fusion_only",
     "--lora_ckpt", {
       "first_existing": [
