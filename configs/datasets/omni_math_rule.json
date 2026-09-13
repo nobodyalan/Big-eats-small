@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "name": "omni_math_rule",
+  "path": "data/omni_math_rule_test.jsonl",
+  "manifest": "data/omni_math_rule_manifest.json",
+  "source": "https://github.com/KbsdJames/omni-math-rule",
+  "split": "test-only",
+  "expected_records": 2821,
+  "difficulty_levels": "1-10",
+  "notes": "Official Omni-MATH subset selected for rule-based evaluation. Never mix into SFT training data."
+}

@@ -83,6 +83,38 @@ SELECTION_GPU=0 EXPERIMENT_GPU=1 bash scripts/run_two_gpu_pipeline.sh
 powershell -ExecutionPolicy Bypass -File scripts/run_local_smoke.ps1
 ```
 
+### Omni-MATH 高难评测
+
+Omni-MATH 只作为测试集，禁止混入 SFT 训练数据。默认下载官方筛选的规则判分
+子集：
+
+```bash
+python3 scripts/download_omni_math.py
+```
+
+先对每个可用整数难度带各跑 20 题；结果 JSON 会同时保存整体和逐难度正确率：
+
+```bash
+python3 eval/eval_math.py --bench omni_math --omni_levels 1-10 \
+  --omni_limit_per_level 20 --ckpt <bridge-checkpoint> <bridge参数...>
+```
+
+官方 difficulty 含 7.5、4.375 等连续值。程序按整数难度带分层：L7 表示原始
+difficulty 位于 `[7,8)`；`--omni_levels 5-10` 表示所有 difficulty ≥5。
+
+再根据 pilot 结果，选择模型正确率约为 10%–40% 的连续难度段：
+
+```bash
+python3 eval/recommend_omni_levels.py <pilot-result.json> --metric fusion
+```
+
+正式评测使用推荐等级并分层抽取固定 400 题，例如：
+
+```bash
+python3 eval/eval_math.py --bench omni_math --omni_levels 5-10 \
+  --limit 400 --ckpt <bridge-checkpoint> <bridge参数...>
+```
+
 新实验不再以 `cache/` 作为唯一产物目录：配置进入 `configs/`，权重进入
 `models/trained/<direction>/<model>/<variant>/<seed>/`，日志和准确率结果
 使用相同的语义分类路径。`cache/` 仅保留可重建的下载、位置搜索和临时文件。

@@ -53,6 +53,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_new", type=int, default=512)
     parser.add_argument("--math_level", type=int, default=0, help="只测 MATH 指定难度(0=全部)")
+    parser.add_argument("--omni_path", default="data/omni_math_rule_test.jsonl")
+    parser.add_argument("--omni_levels", default="5-10")
+    parser.add_argument("--omni_limit_per_level", type=int, default=0)
     parser.add_argument("--out_dir", default="eval_results")
     parser.add_argument("--tag", default="", help="汇总表文件名标签")
     args = parser.parse_args()
@@ -65,6 +68,11 @@ def main():
             "--out_dir", args.out_dir]
     if args.math_level:
         base += ["--math_level", str(args.math_level)]
+    if args.bench == "omni_math":
+        base += ["--omni_path", args.omni_path,
+                 "--omni_levels", args.omni_levels]
+        if args.omni_limit_per_level > 0:
+            base += ["--omni_limit_per_level", str(args.omni_limit_per_level)]
 
     jobs = []
     if args.old_ckpt:
@@ -95,6 +103,9 @@ def main():
     # ── 汇总 ──
     if args.bench == "aime":
         benches = ["AIME"]
+    elif args.bench == "omni_math":
+        level_name = args.omni_levels.replace(",", "_").replace(" ", "")
+        benches = [f"OMNI_MATH_L{level_name}"]
     else:
         benches = []
         if args.bench in ("math", "both"):

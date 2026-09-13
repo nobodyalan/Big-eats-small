@@ -34,6 +34,8 @@ sys.path.insert(0, os.path.join(_ROOT, "scripts"))
 from main import (Config, attach_fusion, load_fusion, resolve_dtype,
                   resolve_model_path, build_prompt_text)
 from download_math import download_file
+from omni_math_utils import (load_omni_math_items, parse_level_set,
+                             summarize_by_difficulty)
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -270,6 +272,10 @@ def load_aime_test(seed: int, limit: int):
     return items
 
 
+# ────────────────────────── Omni-MATH 数据 ──────────────────────────
+OMNI_MATH_PATH = "data/omni_math_rule_test.jsonl"
+
+
 # ────────────────────────────── 主流程 ──────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="MATH / GSM8K 分层评测: fusion vs baseline")
@@ -295,8 +301,9 @@ def main():
     parser.add_argument("--fusion_device", default="", help="旁路模型设备(空=自动 cuda:0)")
     parser.add_argument("--lora_device", default="", help="LoRA 模型设备(空=自动另一张卡)")
     parser.add_argument("--bench", default="both",
-                        choices=["math", "gsm8k", "both", "aime", "segments"],
-                        help="评测哪个数据集(math/gsm8k/both/aime/segments)")
+                        choices=["math", "gsm8k", "both", "aime", "omni_math",
+                                 "segments"],
+                        help="评测哪个数据集(math/gsm8k/both/aime/omni_math/segments)")
     parser.add_argument("--limit", type=int, default=200, help="每个数据集最多评测多少题(0=全部)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_new", type=int, default=512)
@@ -309,6 +316,12 @@ def main():
                         help="segments 模式下 MATH 低级区间(如 1-3 / 1,2,3)")
     parser.add_argument("--math_hi", default="4-5",
                         help="segments 模式下 MATH 高级区间(如 4-5 / 5)")
+    parser.add_argument("--omni_path", default=OMNI_MATH_PATH,
+                        help="规范化 Omni-MATH JSONL（默认官方 rule 子集）")
+    parser.add_argument("--omni_levels", default="5-10",
+                        help="Omni-MATH 难度，如 1-10 / 5-10 / 7,8,9；默认 5-10")
+    parser.add_argument("--omni_limit_per_level", type=int, default=0,
+                        help="每个难度抽取题数；>0 时覆盖 --limit，供等级 pilot 使用")
     parser.add_argument(
         "--segment_only", default="all",
         choices=["all", "gsm8k", "math_lo", "math_hi"],
@@ -327,6 +340,8 @@ def main():
         parser.error("--baseline_only 不应同时传入实验 checkpoint")
     if args.segment_only != "all" and args.bench != "segments":
         parser.error("--segment_only 仅可与 --bench segments 一起使用")
+    if args.omni_limit_per_level < 0:
+        parser.error("--omni_limit_per_level 必须 >= 0")
 
     # ── 选择 benchmark(数据 + 判分函数) ──
     benches = []
@@ -345,6 +360,23 @@ def main():
         benches.append(("AIME", load_aime_test(args.seed, args.limit),
                         lambda r: str(r.get("answer", "")).strip(),
                         extract_pred_gsm8k, gsm8k_equal))
+    if args.bench == "omni_math":
+        if not os.path.exists(args.omni_path):
+            raise SystemExit(
+                f"[错误] 缺 Omni-MATH 数据 {args.omni_path}, "
+                "先跑 scripts/download_omni_math.py")
+        try:
+            omni_levels = parse_level_set(args.omni_levels)
+            omni_items = load_omni_math_items(
+                args.omni_path, seed=args.seed, limit=args.limit,
+                levels=omni_levels,
+                limit_per_level=args.omni_limit_per_level)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"[错误] Omni-MATH 数据无效: {exc}") from exc
+        level_name = args.omni_levels.replace(",", "_").replace(" ", "")
+        benches.append((f"OMNI_MATH_L{level_name}", omni_items,
+                        lambda r: str(r.get("answer", "")).strip(),
+                        extract_boxed, answers_equal))
     if args.bench == "segments":
         # 三段可顺序运行，也可用 --segment_only 拆成独立进程并行运行。
         selected = args.segment_only
@@ -467,7 +499,12 @@ def main():
             problem = r.get("problem", "")
             gold = gold_fn(r)
             prompt = math_prompt(problem)
-            rec = {"id": i, "problem": problem, "gold": gold}
+            rec = {"id": r.get("benchmark_id", i),
+                   "problem": problem, "gold": gold}
+            # Omni-MATH 的分层信息进入逐题结果，供难度选择与领域诊断使用。
+            for field in ("difficulty", "difficulty_band", "domain", "source"):
+                if field in r:
+                    rec[field] = r[field]
 
             # ① 纯 4B baseline(旁路关 = LoRA 关, 二者等价, 只算一次)
             if not args.fusion_only:
@@ -527,6 +564,15 @@ def main():
                 summary[key] = c
                 summary[f"{label}_acc"] = round(c / n_total, 4) if n_total else 0
                 print(f"[{name}] {label} 准确率: {summary[f'{label}_acc']:.2%} ({c}/{n_total})")
+        if name.startswith("OMNI_MATH"):
+            summary["by_difficulty"] = summarize_by_difficulty(results)
+            print(f"[{name}] 分难度结果:")
+            for level, part in summary["by_difficulty"].items():
+                values = []
+                for label in ("baseline", "fusion", "lora"):
+                    if f"{label}_acc" in part:
+                        values.append(f"{label}={part[f'{label}_acc']:.2%}")
+                print(f"  L{level} n={part['n']}: " + " | ".join(values))
         if results and "fusion_pred" in results[0] and "baseline_pred" in results[0]:
             n_diff = sum(1 for x in results if x.get("fusion_pred") != x.get("baseline_pred"))
             summary["n_answer_changed"] = n_diff
@@ -546,6 +592,9 @@ def main():
                        "lora_ckpt": args.lora_ckpt,
                        "small_start": args.small_start, "small_end": args.small_end,
                        "seed": args.seed, "segment_only": args.segment_only,
+                       "omni_path": args.omni_path,
+                       "omni_levels": args.omni_levels,
+                       "omni_limit_per_level": args.omni_limit_per_level,
                        "summary": summary,
                        "results": results}, f, ensure_ascii=False, indent=2)
         print(f"结果已保存: {path}")
