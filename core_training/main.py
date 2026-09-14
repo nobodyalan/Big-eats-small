@@ -70,11 +70,7 @@ class Config:
     fusion_bypass_small: bool = False  # True=跳过冻结小模型层，作为 bridge-only 对照
 
     # ── 最终解码 ──────────────────────────────────────────────────────────
-    max_new_tokens: int = 512
-    temperature: float = 0.6
-    top_p: float = 0.95
-    top_k: int = 20                 # 采样 top-k(Qwen3 官方推荐参数 TopK=20,抑制发散;0=关闭)
-    repetition_penalty: float = 1.0   # 解码重复惩罚(>1 抑制已出现 token, 打断"英镑英镑..."式循环)
+    max_new_tokens: int = 1536
 
     # ── 其他 ──────────────────────────────────────────────────────────────
     cache_dir: str = "cache"    # 磁盘缓存目录(其他脚本如 bridge_train.py 会用到)
@@ -175,33 +171,6 @@ def resolve_model_path(model_id: str, local_override: Optional[str]) -> str:
         return model_id  # 没有 modelscope 时直接用 HuggingFace 模型 id
 
 
-def sample_token(logits: torch.Tensor, temperature: float, top_p: float,
-                 seen_ids=None, repetition_penalty: float = 1.0, top_k: int = 0) -> torch.Tensor:
-    """带 temperature / top_p / top_k / 重复惩罚的采样,返回形状 (1, 1) 的 token id"""
-    logits = logits.float().clone()
-    if seen_ids and repetition_penalty != 1.0:
-        for tid in seen_ids:                # 压低已生成 token 的分数,打断重复循环
-            if repetition_penalty > 1.0:
-                logits[0, tid] /= repetition_penalty
-            else:
-                logits[0, tid] *= repetition_penalty
-    if top_k > 0:                           # top-k 过滤: 只保留概率最大的 k 个候选,抑制发散
-        v, _ = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1)
-        logits[logits < v[..., -1:]] = float("-inf")
-    logits = logits / max(temperature, 1e-6)
-    probs = torch.softmax(logits, dim=-1)
-    if top_p < 1.0:
-        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
-        cum = torch.cumsum(sorted_probs, dim=-1)
-        mask = cum > top_p
-        mask[..., 1:] = mask[..., :-1].clone()
-        mask[..., 0] = False  # 至少保留概率最大的一个 token
-        probs = torch.zeros_like(probs).scatter_(-1, sorted_idx,
-                                                 sorted_probs.masked_fill(mask, 0.0))
-        probs = probs / probs.sum(dim=-1, keepdim=True)
-    return torch.multinomial(probs, 1)
-
-
 def build_prompt_text(tokenizer, prompt: str) -> str:
     """构造对话模板文本;0.6B(基座)与 4B(Instruct)共用同一分词器与模板"""
     if tokenizer.chat_template:
@@ -216,7 +185,7 @@ def build_prompt_text(tokenizer, prompt: str) -> str:
 # ║  ⑦ 主脑 4B: 文本解码                                                    ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 def decode_answer(model, tokenizer, h_last: torch.Tensor, past, config: Config) -> str:
-    """从 4B 最后的隐状态出发,逐 token 采样解码成文本"""
+    """从 4B 最后的隐状态出发，以确定性贪心方式逐 token 解码。"""
     dev = model_device(model)
     eos = tokenizer.eos_token_id
     generated = []
@@ -225,10 +194,7 @@ def decode_answer(model, tokenizer, h_last: torch.Tensor, past, config: Config) 
     with torch.inference_mode():
         for _ in range(config.max_new_tokens):
             logits = model.lm_head(h_last)                       # (1, 1, V)
-            next_token = sample_token(logits[:, -1, :], config.temperature, config.top_p,
-                                      seen_ids=generated,
-                                      repetition_penalty=config.repetition_penalty,
-                                      top_k=config.top_k)
+            next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
             tok = int(next_token.item())
             generated.append(tok)
             if tok == eos:
@@ -803,8 +769,6 @@ def run_evaluation(model_large, tokenizer, config: Config) -> str:
                 "fusion_pos2_frac": config.fusion_pos2_frac,
                 "fusion_mlp_dim": config.fusion_mlp_dim,
                 "max_new_tokens": config.max_new_tokens,
-                "temperature": config.temperature,
-                "top_p": config.top_p,
                 "seed": config.seed},
             "question_count": len(EVAL_QUESTIONS),
         },

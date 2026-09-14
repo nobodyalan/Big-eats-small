@@ -55,9 +55,7 @@ def answer_one(model, tokenizer, question: str, config: Config) -> dict:
         outputs = model.generate(
             **inputs,
             max_new_tokens=config.max_new_tokens,
-            do_sample=(config.temperature > 0),
-            temperature=config.temperature,
-            top_p=config.top_p,
+            do_sample=False,
         )
     dt = time.time() - t0
     reply = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:],
@@ -105,8 +103,6 @@ def run_baseline(config: Config, model_names) -> str:
             "torch": torch.__version__,
             "cuda": torch.cuda.is_available(),
             "params": {"max_new_tokens": config.max_new_tokens,
-                       "temperature": config.temperature,
-                       "top_p": config.top_p,
                        "seed": config.seed},
             "question_count": len(EVAL_QUESTIONS),
         },
