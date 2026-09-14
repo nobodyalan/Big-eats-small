@@ -178,6 +178,41 @@ class MultiFusionRuntimeTests(unittest.TestCase):
         self.assertEqual([(branch.starts, branch.ends) for branch in branches],
                          [(1, 1), (1, 1)])
 
+        _, meta = generate(
+            DummyModel(branches), DummyTokenizer(), "question", 1,
+            return_meta=True)
+        self.assertEqual(meta["generated_tokens"], 1)
+        self.assertEqual(meta["finish_reason"], "length")
+        self.assertTrue(meta["hit_max_new_tokens"])
+        self.assertEqual(meta["max_new_tokens"], 1)
+
+    def test_eval_generate_does_not_mark_final_eos_as_truncated(self):
+        class DummyTokenizer:
+            chat_template = None
+            eos_token_id = 2
+
+            def __call__(self, text, return_tensors=None):
+                return SimpleNamespace(input_ids=torch.tensor([[1, 3]]),
+                                       attention_mask=torch.ones(1, 2, dtype=torch.long))
+
+            def decode(self, ids, skip_special_tokens=True):
+                return "done"
+
+        class DummyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+            def generate(self, ids, **kwargs):
+                return torch.cat(
+                    [ids, torch.tensor([[4, 2]], device=ids.device)], dim=1)
+
+        _, meta = generate(
+            DummyModel(), DummyTokenizer(), "question", 2, return_meta=True)
+        self.assertEqual(meta["generated_tokens"], 2)
+        self.assertEqual(meta["finish_reason"], "eos")
+        self.assertFalse(meta["hit_max_new_tokens"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -342,7 +342,8 @@ def attach_multi_fusion_checkpoint(model_large, model_small, payload):
     return fusion_map, meta
 
 
-def generate(model, tokenizer, prompt: str, max_new: int) -> str:
+def generate(model, tokenizer, prompt: str, max_new: int,
+             return_meta: bool = False):
     text = build_prompt_text(tokenizer, prompt)
     tok = tokenizer(text, return_tensors="pt")
     ids = tok.input_ids.to(next(model.parameters()).device)
@@ -359,7 +360,33 @@ def generate(model, tokenizer, prompt: str, max_new: int) -> str:
     finally:
         for fusion in active_fusions:
             fusion.end_generation()
-    return tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
+    generated_ids = out[0][ids.shape[1]:]
+    generated_tokens = int(generated_ids.numel())
+    eos_ids = tokenizer.eos_token_id
+    if isinstance(eos_ids, int):
+        eos_ids = {eos_ids}
+    elif eos_ids is None:
+        eos_ids = set()
+    else:
+        eos_ids = {int(token_id) for token_id in eos_ids}
+    ended_with_eos = bool(
+        generated_tokens and int(generated_ids[-1].item()) in eos_ids)
+    hit_max_new_tokens = generated_tokens >= max_new and not ended_with_eos
+    if ended_with_eos:
+        finish_reason = "eos"
+    elif hit_max_new_tokens:
+        finish_reason = "length"
+    else:
+        finish_reason = "other"
+    decoded = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    if not return_meta:
+        return decoded
+    return decoded, {
+        "generated_tokens": generated_tokens,
+        "finish_reason": finish_reason,
+        "hit_max_new_tokens": hit_max_new_tokens,
+        "max_new_tokens": int(max_new),
+    }
 
 
 def ensure_zip(zip_path: str):
@@ -458,7 +485,7 @@ def main():
                         help="评测哪个数据集(math/gsm8k/both/aime/omni_math/segments)")
     parser.add_argument("--limit", type=int, default=200, help="每个数据集最多评测多少题(0=全部)")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--max_new", type=int, default=512)
+    parser.add_argument("--max_new", type=int, default=1536)
     parser.add_argument("--attn_impl", default="",
                         help="4B 注意力实现；正式评测应与训练一致")
     parser.add_argument("--zip", default=ZIP_PATH)
@@ -487,7 +514,7 @@ def main():
                         help=("保留严格 boxed 指标，并额外报告 The answer is/#### "
                               "标记兜底的诊断指标"))
     parser.add_argument("--math_judge", choices=["legacy", "both"],
-                        default="legacy",
+                        default="both",
                         help=("MATH 判分器：legacy=原严格 boxed；both=同时报告严格 "
                               "boxed 与 Math-Verify（推荐）"))
     parser.add_argument("--save_raw_output", action="store_true",
@@ -709,10 +736,14 @@ def main():
                    "problem": problem, "gold": gold}
             math_strict = pred_fn is extract_boxed
 
-            def record_prediction(label, generated_text):
+            def record_prediction(label, generated_text, generation_meta=None):
                 answer = pred_fn(generated_text)
                 rec[f"{label}_pred"] = answer
                 rec[f"{label}_correct"] = score_fn(answer, gold)
+                if generation_meta is not None:
+                    for field in ("generated_tokens", "finish_reason",
+                                  "hit_max_new_tokens", "max_new_tokens"):
+                        rec[f"{label}_{field}"] = generation_meta[field]
                 if args.save_raw_output:
                     rec[f"{label}_text"] = generated_text
                 if args.diagnose_math_format and math_strict:
@@ -739,29 +770,37 @@ def main():
                 try:
                     if large_f is not None:
                         set_fusion(False)
-                        pred_base = generate(large_f, tokenizer, prompt, args.max_new)
+                        pred_base, meta_base = generate(
+                            large_f, tokenizer, prompt, args.max_new,
+                            return_meta=True)
                     elif large_l is not None:
                         set_lora(False)
-                        pred_base = generate(large_l, tokenizer, prompt, args.max_new)
+                        pred_base, meta_base = generate(
+                            large_l, tokenizer, prompt, args.max_new,
+                            return_meta=True)
                     else:
-                        pred_base = generate(large_b, tokenizer, prompt, args.max_new)
+                        pred_base, meta_base = generate(
+                            large_b, tokenizer, prompt, args.max_new,
+                            return_meta=True)
                 finally:
                     # generate 抛异常也要恢复为开启, 防状态残留污染后续结果
                     set_fusion(True)
                     set_lora(True)
-                record_prediction("baseline", pred_base)
+                record_prediction("baseline", pred_base, meta_base)
 
             # ② 旁路开
             if large_f is not None:
                 set_fusion(True)
-                pred_f = generate(large_f, tokenizer, prompt, args.max_new)
-                record_prediction("fusion", pred_f)
+                pred_f, meta_f = generate(
+                    large_f, tokenizer, prompt, args.max_new, return_meta=True)
+                record_prediction("fusion", pred_f, meta_f)
 
             # ③ LoRA 开
             if large_l is not None:
                 set_lora(True)
-                pred_l = generate(large_l, tokenizer, prompt, args.max_new)
-                record_prediction("lora", pred_l)
+                pred_l, meta_l = generate(
+                    large_l, tokenizer, prompt, args.max_new, return_meta=True)
+                record_prediction("lora", pred_l, meta_l)
 
             results.append(rec)
             parts = [f"[{name} {i}/{n}]"]
@@ -807,6 +846,16 @@ def main():
                     extracted / n_total, 4) if n_total else 0
                 print(f"[{name}] {label} 严格答案提取率: "
                       f"{summary[f'{label}_extract_rate']:.2%} ({extracted}/{n_total})")
+                length_stops = sum(
+                    1 for x in results
+                    if x.get(f"{label}_hit_max_new_tokens") is True)
+                if any(f"{label}_hit_max_new_tokens" in x for x in results):
+                    summary[f"{label}_length_stops"] = length_stops
+                    summary[f"{label}_length_stop_rate"] = round(
+                        length_stops / n_total, 4) if n_total else 0
+                    print(f"[{name}] {label} 命中生成上限: "
+                          f"{summary[f'{label}_length_stop_rate']:.2%} "
+                          f"({length_stops}/{n_total})")
                 relaxed_key = f"{label}_relaxed_correct"
                 if any(relaxed_key in x for x in results):
                     relaxed_correct = sum(1 for x in results if x.get(relaxed_key))

@@ -51,7 +51,7 @@ def main():
     parser.add_argument("--bench", default="both")
     parser.add_argument("--limit", type=int, default=400)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--max_new", type=int, default=512)
+    parser.add_argument("--max_new", type=int, default=1536)
     parser.add_argument("--math_level", type=int, default=0, help="只测 MATH 指定难度(0=全部)")
     parser.add_argument("--omni_path", default="data/omni_math_rule_test.jsonl")
     parser.add_argument("--omni_levels", default="5-10")

@@ -44,7 +44,7 @@ def main():
     ap.add_argument("--lora_ckpt", default="cache/lora_r21_sft.best", help="LoRA 权重目录")
     ap.add_argument("--limit", type=int, default=400)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--max_new", type=int, default=512)
+    ap.add_argument("--max_new", type=int, default=1536)
     ap.add_argument("--math_lo", default="1-3", help="MATH 低级区间")
     ap.add_argument("--math_hi", default="4-5", help="MATH 高级区间")
     ap.add_argument("--out_dir", default="eval_results")
