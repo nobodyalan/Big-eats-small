@@ -1,0 +1,16 @@
+{
+  "recipe_version": "math_majority_answer_corrections_v1",
+  "description": "人工核对 math_majority_all.jsonl 中缺少可解析最终答案的记录；键为 UTF-8 prompt 的 SHA-256。",
+  "corrections": {
+    "978acc132e486c00e325c7cc4ec18f5bd59f0e728760fb55b7265300845d7423": {
+      "answer": "0",
+      "source": "MATH_train",
+      "reason": "原 response 证明所有 P+n 都是合数，但最终答案为空的 \\boxed{}。"
+    },
+    "ff9637dd192354108924a480b0e9eef6ae588285e9af400b3c3d5d244b43a3fc": {
+      "answer": "0",
+      "source": "MATH_train",
+      "reason": "原 response 结论明确为区间内全为合数，但最终写成空的 \\boxed{}。"
+    }
+  }
+}

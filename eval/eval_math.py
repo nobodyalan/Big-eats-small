@@ -33,8 +33,9 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "core_training"))
 sys.path.insert(0, os.path.join(_ROOT, "scripts"))
 
-from main import (Config, attach_fusion, load_fusion, resolve_dtype,
-                  resolve_model_path, build_prompt_text)
+from main import (Config, attach_fusion, attached_fusions, load_fusion,
+                  load_multi_fusion, resolve_dtype, resolve_model_path,
+                  build_prompt_text)
 from download_math import download_file
 from omni_math_utils import (load_omni_math_items, parse_level_set,
                              summarize_by_difficulty)
@@ -50,15 +51,25 @@ ZIP_PATH = "data/.cache/math/MATH.zip"
 
 # ────────────────────────────── 判分工具 ──────────────────────────────
 def extract_boxed(text: str):
-    """取文本中最后一个 \\boxed{...} 的内容(平衡括号); 没有则返回 None"""
+    """取最后一个 ``\\boxed`` 的内容；兼容花括号与官方 MATH 无括号写法。"""
     if not text:
         return None
     idx = text.rfind("\\boxed")
     if idx == -1:
         return None
-    i = text.find("{", idx)
-    if i == -1:
+    i = idx + len(r"\boxed")
+    while i < len(text) and text[i].isspace():
+        i += 1
+    if i >= len(text):
         return None
+    if text[i] != "{":
+        candidate = text[i:].splitlines()[0].strip()
+        if candidate.startswith("$"):
+            candidate = candidate[1:]
+        math_end = candidate.find("$")
+        if math_end >= 0:
+            candidate = candidate[:math_end]
+        return candidate.rstrip("。.;；").strip() or None
     depth = 0
     for j in range(i, len(text)):
         if text[j] == "{":
@@ -297,14 +308,48 @@ def math_prompt(problem: str) -> str:
             f"answer in \\boxed{{...}}:\n\n{problem}")
 
 
+def attach_multi_fusion_checkpoint(model_large, model_small, payload):
+    """依据 checkpoint 自带元数据挂载并加载 upstream/downstream 两条旁路。"""
+    if (not isinstance(payload, dict)
+            or payload.get("format") != "bes_multi_fusion_v1"):
+        raise ValueError("不是 BES 双 Bridge checkpoint")
+    saved_fusions = payload.get("fusions", {})
+    required_names = ("upstream", "downstream")
+    if any(name not in saved_fusions for name in required_names):
+        raise ValueError("双 Bridge checkpoint 必须包含 upstream/downstream")
+    fusion_map = {}
+    for fusion_name in required_names:
+        saved_meta = saved_fusions[fusion_name].get("meta", {})
+        required_meta = ("large_l1", "large_l2", "small_s1", "small_s2",
+                         "mlp_dim", "bridge_depth")
+        missing_meta = [key for key in required_meta if key not in saved_meta]
+        if missing_meta:
+            raise ValueError(
+                f"{fusion_name} checkpoint 缺少架构元数据: {missing_meta}")
+        branch_cfg = Config()
+        branch_cfg.fusion_large_start = int(saved_meta["large_l1"])
+        branch_cfg.fusion_large_end = int(saved_meta["large_l2"])
+        branch_cfg.fusion_small_start = int(saved_meta["small_s1"])
+        branch_cfg.fusion_small_end = int(saved_meta["small_s2"])
+        branch_cfg.fusion_mlp_dim = int(saved_meta["mlp_dim"])
+        branch_cfg.fusion_bridge_depth = int(saved_meta["bridge_depth"])
+        branch_cfg.fusion_bypass_small = bool(saved_meta.get("bypass_small", False))
+        fusion_map[fusion_name] = attach_fusion(
+            model_large, model_small, branch_cfg, name=fusion_name)
+    if fusion_map["upstream"].l2 >= fusion_map["downstream"].l1:
+        raise ValueError("双 Bridge checkpoint 的上游注入点必须早于下游捕获点")
+    meta = load_multi_fusion(fusion_map, payload)
+    return fusion_map, meta
+
+
 def generate(model, tokenizer, prompt: str, max_new: int) -> str:
     text = build_prompt_text(tokenizer, prompt)
     tok = tokenizer(text, return_tensors="pt")
     ids = tok.input_ids.to(next(model.parameters()).device)
     amask = tok.attention_mask.to(ids.device)
-    fusion = getattr(model, "_bes_fusion", None)
-    cache_started = fusion is not None and fusion.enabled
-    if cache_started:
+    active_fusions = [fusion for fusion in attached_fusions(model)
+                      if fusion.enabled]
+    for fusion in active_fusions:
         fusion.begin_generation()
     try:
         with torch.inference_mode():
@@ -312,7 +357,7 @@ def generate(model, tokenizer, prompt: str, max_new: int) -> str:
                                  do_sample=False, pad_token_id=tokenizer.eos_token_id,
                                  eos_token_id=tokenizer.eos_token_id)
     finally:
-        if cache_started:
+        for fusion in active_fusions:
             fusion.end_generation()
     return tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
 
@@ -384,6 +429,9 @@ OMNI_MATH_PATH = "data/omni_math_rule_test.jsonl"
 def main():
     parser = argparse.ArgumentParser(description="MATH / GSM8K 分层评测: fusion vs baseline")
     parser.add_argument("--ckpt", default="", help="训练好的 fusion 权重(空=用初始恒等旁路)")
+    parser.add_argument("--multi_fusion_ckpt", default="",
+                        help=("train_multi_fusion.py 保存的双 Bridge 权重；"
+                              "位置/深度/MLP 维度从 checkpoint 自动恢复"))
     parser.add_argument("--small_lora_ckpt", default="",
                         help="与 fusion 配套的小模型 LoRA 目录")
     parser.add_argument("--bridge_depth", type=int, default=1,
@@ -453,7 +501,15 @@ def main():
     args = parser.parse_args()
     if args.fusion_only and args.baseline_only:
         parser.error("--fusion_only 与 --baseline_only 不能同时使用")
-    if args.baseline_only and (args.ckpt or args.small_lora_ckpt or args.lora_ckpt):
+    if args.ckpt and args.multi_fusion_ckpt:
+        parser.error("--ckpt 与 --multi_fusion_ckpt 只能选择一个")
+    if args.multi_fusion_ckpt and args.small_lora_ckpt:
+        parser.error("当前多 Bridge 训练不含 small LoRA，不能传 --small_lora_ckpt")
+    if args.multi_fusion_ckpt and any(value is not None for value in (
+            args.small_start, args.small_end, args.large_start, args.large_end)):
+        parser.error("多 Bridge 的层位置来自 checkpoint，不要再传单 Bridge 层号")
+    if args.baseline_only and (args.ckpt or args.multi_fusion_ckpt
+                               or args.small_lora_ckpt or args.lora_ckpt):
         parser.error("--baseline_only 不应同时传入实验 checkpoint")
     if args.segment_only != "all" and args.bench != "segments":
         parser.error("--segment_only 仅可与 --bench segments 一起使用")
@@ -549,12 +605,15 @@ def main():
 
     # 两个模型可同时挂载(旁路放 fusion 设备, LoRA 放另一张卡), 一次性并行验证两者正确率
     have_fusion = (not args.baseline_only) and (
-        (not args.lora_ckpt) or bool(args.ckpt))  # 只给 --lora_ckpt 时不上旁路
+        (not args.lora_ckpt) or bool(args.ckpt) or bool(args.multi_fusion_ckpt))
     have_lora = (not args.baseline_only) and bool(args.lora_ckpt)
 
     tokenizer = None
     large_f = large_l = large_b = None
     fusion = None
+    fusions = []
+    multi_payload = None
+    multi_meta = None
 
     def _resolve_dev(pref: str, fallback: str) -> str:
         d = pref or fallback
@@ -572,18 +631,35 @@ def main():
         small = AutoModelForCausalLM.from_pretrained(small_path, dtype=dt).to(fdev).eval()
         large_f = AutoModelForCausalLM.from_pretrained(
             large_path, dtype=dt, **attn_kwargs).to(fdev).eval()
-        fusion = attach_fusion(large_f, small, cfg)
-        if args.small_lora_ckpt:
-            from peft import PeftModel
-            # attach_fusion 已保存底层真实层引用；PEFT 原地替换这些层中的线性模块，
-            # 因而手写的小模型片段 forward 会自动使用 LoRA。
-            small_lora_model = PeftModel.from_pretrained(
-                small, args.small_lora_ckpt, is_trainable=False).eval()
-        if args.ckpt:
-            load_fusion(fusion, args.ckpt)
-        gate = float(fusion.scale().detach())
-        print(f"旁路 scale = {gate:.5f} ({'训练后权重' if args.ckpt else '初始恒等'}) "
-              f"(设备 {fdev})")
+        if args.multi_fusion_ckpt:
+            multi_payload = torch.load(args.multi_fusion_ckpt, map_location="cpu")
+            try:
+                fusion_map, multi_meta = attach_multi_fusion_checkpoint(
+                    large_f, small, multi_payload)
+            except ValueError as exc:
+                raise SystemExit(f"[错误] {args.multi_fusion_ckpt}: {exc}") from exc
+            required_names = ("upstream", "downstream")
+            fusions = [fusion_map[name] for name in required_names]
+            fusion = fusions[0]  # 仅供旧的结果标签逻辑兼容；开关会控制全部旁路。
+            scales = ", ".join(
+                f"{name}={float(fusion_map[name].scale().detach()):.5f}"
+                for name in required_names)
+            print(f"双 Bridge scales: {scales} | meta={multi_meta} (设备 {fdev})")
+            del multi_payload
+        else:
+            fusion = attach_fusion(large_f, small, cfg)
+            fusions = [fusion]
+            if args.small_lora_ckpt:
+                from peft import PeftModel
+                # attach_fusion 已保存底层真实层引用；PEFT 原地替换这些层中的线性模块，
+                # 因而手写的小模型片段 forward 会自动使用 LoRA。
+                small_lora_model = PeftModel.from_pretrained(
+                    small, args.small_lora_ckpt, is_trainable=False).eval()
+            if args.ckpt:
+                load_fusion(fusion, args.ckpt)
+            gate = float(fusion.scale().detach())
+            print(f"旁路 scale = {gate:.5f} ({'训练后权重' if args.ckpt else '初始恒等'}) "
+                  f"(设备 {fdev})")
 
     if have_lora:
         from peft import PeftModel
@@ -608,8 +684,8 @@ def main():
         print(f"已加载纯 4B baseline (设备 {bdev}, dtype {dt})")
 
     def set_fusion(on: bool):
-        if fusion is not None:
-            fusion.enabled = on
+        for branch in fusions:
+            branch.enabled = on
 
     def set_lora(on: bool):
         if large_l is not None:
@@ -806,7 +882,15 @@ def main():
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         temporary_path = f"{path}.tmp.{os.getpid()}"
         with open(temporary_path, "w", encoding="utf-8") as f:
-            json.dump({"ckpt": args.ckpt, "small_lora_ckpt": args.small_lora_ckpt,
+            json.dump({"ckpt": args.ckpt,
+                       "multi_fusion_ckpt": args.multi_fusion_ckpt,
+                       "multi_fusion_meta": multi_meta,
+                       "multi_fusion_scales": (
+                           {str(getattr(branch, "fusion_name", index)):
+                            float(branch.scale().detach())
+                            for index, branch in enumerate(fusions)}
+                           if args.multi_fusion_ckpt else None),
+                       "small_lora_ckpt": args.small_lora_ckpt,
                        "lora_ckpt": args.lora_ckpt,
                        "suite_run_id": args.suite_run_id,
                        "small_start": args.small_start, "small_end": args.small_end,

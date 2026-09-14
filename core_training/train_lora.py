@@ -136,7 +136,9 @@ def main():
 
         def lr_lambda(step):
             if step < args.warmup_steps:
-                return step / max(1, args.warmup_steps)
+                # LambdaLR 在第一次 optimizer.step 前已经以 step=0 初始化；
+                # 使用 step+1，避免首个有效更新的学习率恰好为 0。
+                return (step + 1) / max(1, args.warmup_steps)
             p = (step - args.warmup_steps) / max(1, total_steps - args.warmup_steps)
             p = min(1.0, max(0.0, p))
             return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * p))

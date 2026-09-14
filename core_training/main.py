@@ -19,7 +19,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Mapping, Optional
 
 import torch
 import torch.nn as nn
@@ -450,6 +450,23 @@ class GatedResidualFusion(nn.Module):
         return out * self.scale()
 
 
+def enforce_unit_fusion_rmsnorm(fusion: GatedResidualFusion) -> bool:
+    """强制 Bridge 内全部 RMSNorm gamma=1 且冻结。
+
+    返回加载前是否检测到非 1 gamma。旧 checkpoint 曾允许训练 gamma；读取它们时
+    必须显式归一化，否则 gamma 会与 branch alpha 形成不可辨识的尺度乘积。
+    """
+    changed = False
+    with torch.no_grad():
+        for module in fusion.modules():
+            if isinstance(module, nn.RMSNorm):
+                if not torch.equal(module.weight, torch.ones_like(module.weight)):
+                    changed = True
+                module.weight.fill_(1.0)
+                module.weight.requires_grad_(False)
+    return changed
+
+
 def resolve_small_range(config: Config, n_small: int):
     """解析 0.6B 旁路层范围(含端点, 0-based, 已夹紧合规)。"""
     s1 = config.fusion_small_start if config.fusion_small_start is not None \
@@ -477,7 +494,17 @@ def resolve_large_range(config: Config, n_large: int):
     return l1, l2
 
 
-def attach_fusion(model_large, model_small, config: Config) -> GatedResidualFusion:
+def attached_fusions(model_large):
+    """返回挂在主模型上的全部旁路；兼容旧版单旁路属性。"""
+    fusions = getattr(model_large, "_bes_fusions", None)
+    if fusions is not None:
+        return list(fusions)
+    fusion = getattr(model_large, "_bes_fusion", None)
+    return [fusion] if fusion is not None else []
+
+
+def attach_fusion(model_large, model_small, config: Config,
+                  name: Optional[str] = None) -> GatedResidualFusion:
     """
     用前向钩子把门控残差旁路挂到 4B 上:
       pos1 = 36×1/3 = 第 12 层输出 → 捕获隐状态(不改输出)
@@ -516,6 +543,7 @@ def attach_fusion(model_large, model_small, config: Config) -> GatedResidualFusi
     object.__setattr__(fusion, "s2", s2)
     object.__setattr__(fusion, "l1", l1)
     object.__setattr__(fusion, "l2", l2)
+    object.__setattr__(fusion, "fusion_name", name or f"L{l1}-{l2}_s{s1}-{s2}")
     object.__setattr__(fusion, "bypass_small", bool(config.fusion_bypass_small))
 
     state = {}
@@ -538,7 +566,14 @@ def attach_fusion(model_large, model_small, config: Config) -> GatedResidualFusi
         h_src = state.get("h") if fusion.branch_override is None else fusion.branch_override
         if h_src is None:
             return output
-        branch = fusion(h_src)
+        # 分阶段多 Bridge 训练时，上游旁路完全冻结。它只需产生固定特征，
+        # 不需要为其内部保存反向激活；下游参数的梯度并不依赖上游对输入的导数。
+        if torch.is_grad_enabled() and not any(
+                p.requires_grad for p in fusion.parameters()):
+            with torch.no_grad():
+                branch = fusion(h_src)
+        else:
+            branch = fusion(h_src)
         with torch.no_grad():
             base = output[0] if isinstance(output, tuple) else output
             branch_rms = branch.float().pow(2).mean().sqrt()
@@ -553,7 +588,14 @@ def attach_fusion(model_large, model_small, config: Config) -> GatedResidualFusi
     handles = [model_large.model.layers[l1].register_forward_hook(capture),
                model_large.model.layers[l2].register_forward_hook(inject)]
     object.__setattr__(fusion, "hook_handles", handles)
-    object.__setattr__(model_large, "_bes_fusion", fusion)
+    # 多旁路按 attach 顺序注册 hook。early/middle/late 的注入点严格递增时，
+    # 下游捕获到的自然是已经包含上游贡献的主模型残差流。保留 _bes_fusion
+    # 指向第一条旁路，以免旧的单旁路训练/评测代码受影响。
+    registry = attached_fusions(model_large)
+    registry.append(fusion)
+    object.__setattr__(model_large, "_bes_fusions", registry)
+    if getattr(model_large, "_bes_fusion", None) is None:
+        object.__setattr__(model_large, "_bes_fusion", fusion)
     n_branch = sum(p.numel() for p in fusion.adapter1.parameters()) \
                + sum(p.numel() for p in fusion.adapter2.parameters())
     print(f"    门控残差旁路已挂载: 4B 第{l1}层输出取隐状态 → 0.6B 第{s1}~{s2}层 "
@@ -561,11 +603,12 @@ def attach_fusion(model_large, model_small, config: Config) -> GatedResidualFusi
     return fusion
 
 
-def save_fusion(fusion: GatedResidualFusion, path: str):
-    """保存旁路参数 + 架构元数据(层范围/维度), 便于加载时校验参数合规性。"""
-    payload = {
+def fusion_payload(fusion: GatedResidualFusion):
+    """构造一个可嵌入单/多旁路 checkpoint 的标准载荷。"""
+    return {
         "state_dict": fusion.state_dict(),
         "meta": {
+            "name": str(getattr(fusion, "fusion_name", "fusion")),
             "small_s1": int(getattr(fusion, "s1", -1)),
             "small_s2": int(getattr(fusion, "s2", -1)),
             "large_l1": int(getattr(fusion, "l1", -1)),
@@ -579,13 +622,63 @@ def save_fusion(fusion: GatedResidualFusion, path: str):
             "format_version": 2,
         },
     }
+
+
+def save_fusion(fusion: GatedResidualFusion, path: str):
+    """保存旁路参数 + 架构元数据(层范围/维度), 便于加载时校验参数合规性。"""
+    payload = fusion_payload(fusion)
     torch.save(payload, path)
     print(f"    旁路参数已保存: {path}")
+
+
+def save_multi_fusion(fusions: Mapping[str, GatedResidualFusion], path: str,
+                      meta: Optional[dict] = None):
+    """保存多条旁路；每条仍使用与单 Bridge 相同的 state/meta 结构。"""
+    if not fusions:
+        raise ValueError("至少需要一条 fusion")
+    payload = {
+        "format": "bes_multi_fusion_v1",
+        "fusions": {name: fusion_payload(fusion) for name, fusion in fusions.items()},
+        "meta": dict(meta or {}),
+    }
+    torch.save(payload, path)
+    print(f"    多旁路参数已保存: {path}")
+
+
+def load_multi_fusion(fusions: Mapping[str, GatedResidualFusion], source):
+    """按名称加载多旁路 checkpoint，并复用单旁路的严格架构校验。
+
+    ``source`` 可以是路径，也可以是已经反序列化的载荷；评测器需要先读取
+    checkpoint 元数据来搭建两条旁路，传入载荷可避免再读一遍大型权重文件。
+    """
+    if isinstance(source, (str, os.PathLike)):
+        obj = torch.load(source, map_location="cpu")
+        source_name = str(source)
+    else:
+        obj = source
+        source_name = "<in-memory multi-fusion checkpoint>"
+    if not isinstance(obj, dict) or obj.get("format") != "bes_multi_fusion_v1":
+        raise ValueError(f"不是 BES 多旁路 checkpoint: {source_name}")
+    saved = obj.get("fusions", {})
+    missing = [name for name in fusions if name not in saved]
+    if missing:
+        raise ValueError(f"多旁路 checkpoint 缺少: {missing}")
+    # 直接复用单旁路的载荷校验逻辑，避免临时文件和重复反序列化。
+    for name, fusion in fusions.items():
+        _load_fusion_payload(fusion, saved[name], f"{source_name}:{name}")
+    print(f"    多旁路参数已加载: {source_name}")
+    return obj.get("meta", {})
 
 
 def load_fusion(fusion: GatedResidualFusion, path: str):
     """加载旁路参数; 兼容旧版裸 state_dict, 并对新格式做层范围/维度校验。"""
     obj = torch.load(path, map_location="cpu")
+    _load_fusion_payload(fusion, obj, path)
+    print(f"    旁路参数已加载: {path}")
+
+
+def _load_fusion_payload(fusion: GatedResidualFusion, obj, source: str):
+    """加载已反序列化的单旁路载荷。"""
     if isinstance(obj, dict) and "state_dict" in obj:
         sd = obj["state_dict"]
         meta = obj.get("meta", {})
@@ -629,7 +722,9 @@ def load_fusion(fusion: GatedResidualFusion, path: str):
         fusion.branch_alpha.requires_grad_(mode == "rezero")
         fusion.gate_logit.requires_grad_(mode == "sigmoid")
         fusion.load_state_dict(sd)
-    print(f"    旁路参数已加载: {path}")
+    if enforce_unit_fusion_rmsnorm(fusion):
+        print(f"    [兼容修正] {source} 含非 1 RMSNorm gamma，已重置为 1 并冻结")
+    return meta
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -647,9 +742,10 @@ def fused_inference(model_large, tokenizer, config: Config, prompt: str):
     dev_l = model_device(model_large)
     embeds_l = model_large.model.embed_tokens(input_ids.to(dev_l))
     attention_mask = torch.ones((1, input_ids.shape[1]), device=dev_l)
-    fusion = getattr(model_large, "_bes_fusion", None)
-    if fusion is not None and fusion.enabled:
-        fusion.begin_generation()
+    fusions = attached_fusions(model_large)
+    for fusion in fusions:
+        if fusion.enabled:
+            fusion.begin_generation()
     try:
         # 预填充: 跑一遍 4B 得到最后隐状态与 KV cache；旁路同步建立自己的 KV。
         with torch.inference_mode():
@@ -659,7 +755,7 @@ def fused_inference(model_large, tokenizer, config: Config, prompt: str):
         h_last = outputs.last_hidden_state[:, -1:, :]
         answer = decode_answer(model_large, tokenizer, h_last, past, config)
     finally:
-        if fusion is not None:
+        for fusion in fusions:
             fusion.end_generation()
 
     stats = {

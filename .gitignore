@@ -25,6 +25,8 @@ eval_results/
 
 # ── 文档 PDF(本地参考, 不入库) ───────────────────────────
 big-small-approaches.pdf
+output/
+tmp/
 
 # ── Jupyter ─────────────────────────────────────────────
 .ipynb_checkpoints/
