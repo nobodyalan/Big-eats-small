@@ -582,15 +582,18 @@ def attach_fusion(model_large, model_small, config: Config,
 
     def inject_pre_block(module, args, kwargs):
         """在 block 的 attention 之前修改其输入残差流，其他参数保持原样。"""
-        if not fusion.enabled:
-            return None
         if args:
             base = args[0]
         else:
             base = kwargs.get("hidden_states")
         if base is None:
             raise RuntimeError("pre_block hook 未找到 hidden_states")
+        # baseline/消融会临时关闭旁路，但 shuffled 诊断仍必须取得同一个当前
+        # batch 的残差流。先刷新捕获状态，再决定是否注入，不能沿用训练 batch
+        # 遗留的不同序列长度 hidden state。
         state["h"] = base
+        if not fusion.enabled:
+            return None
         h_src = base if fusion.branch_override is None else fusion.branch_override
         branch = branch_for(h_src, base)
         fused = base + branch.to(base.dtype)

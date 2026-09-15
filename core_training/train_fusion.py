@@ -290,6 +290,10 @@ def mismatched_hidden(hidden, attention_mask=None):
     hidden = hidden.detach()
     if attention_mask is None:
         attention_mask = torch.ones(hidden.shape[:2], device=hidden.device, dtype=torch.long)
+    elif tuple(attention_mask.shape) != tuple(hidden.shape[:2]):
+        raise ValueError(
+            "mismatched_hidden 要求 hidden 与 attention_mask 属于同一 batch: "
+            f"hidden={tuple(hidden.shape[:2])}, mask={tuple(attention_mask.shape)}")
     else:
         attention_mask = attention_mask.to(hidden.device)
     lengths = attention_mask.long().sum(dim=1).clamp_min(1)

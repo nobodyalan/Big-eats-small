@@ -115,6 +115,17 @@ class FusionRuntimeTests(unittest.TestCase):
         self.assertEqual(fusion.l1, fusion.l2)
         self.assertEqual(fusion.injection_mode, "pre_block")
 
+    def test_preblock_disabled_still_refreshes_current_batch_capture(self):
+        _, large, fusion = tiny_preblock_fusion(layer=2)
+        fusion.enabled = False
+        ids_long = torch.randint(0, 64, (1, 7))
+        ids_short = torch.randint(0, 64, (1, 3))
+        with torch.no_grad():
+            large.model(input_ids=ids_long, use_cache=False)
+            self.assertEqual(tuple(fusion.hook_state["h"].shape[:2]), (1, 7))
+            large.model(input_ids=ids_short, use_cache=False)
+            self.assertEqual(tuple(fusion.hook_state["h"].shape[:2]), (1, 3))
+
     def test_answer_weighting_uses_last_supported_marker(self):
         text = r"first \\boxed{2}, correction: #### 3. The answer is: 4"
         self.assertEqual(answer_start_char(text), text.index("The answer is:"))
