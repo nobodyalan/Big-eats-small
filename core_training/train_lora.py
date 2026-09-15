@@ -43,7 +43,8 @@ DEFAULT_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj",
 
 def main():
     parser = argparse.ArgumentParser(description="LoRA 对照组训练(纯 4B)")
-    parser.add_argument("--data", default="data/mix_all.jsonl")
+    parser.add_argument("--data", default="data/math_majority_v3_all.jsonl",
+                        help="训练+验证合并 JSONL；默认使用原题组隔离的 v3 数据")
     parser.add_argument("--max_samples", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--max_len", type=int, default=1024)
@@ -60,13 +61,16 @@ def main():
     parser.add_argument("--answer_weight", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval_every", type=int, default=200)
-    parser.add_argument("--eval_samples", type=int, default=4000)
+    parser.add_argument("--eval_samples", type=int, default=1999)
     parser.add_argument("--eval_batch_size", type=int, default=8)
     parser.add_argument("--eval_max_samples", type=int, default=400)
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--out", default=None,
                         help="LoRA 权重目录(默认=自动 cache/lora_r<r>_<时间戳>)")
     parser.add_argument("--patience", type=int, default=0)
+    parser.add_argument("--save_each_epoch", type=int, choices=(0, 1), default=0,
+                        help=("1=每个完整 epoch 另存不可变 LoRA checkpoint，供训练后"
+                              "用自由生成正确率选择；默认 0"))
     parser.add_argument("--plot", default=None,
                         help="loss 图路径(默认=自动带 rank+时间戳; 传空字符串=不画)")
     parser.add_argument("--attn_impl", default="",
@@ -228,6 +232,10 @@ def main():
                     stop = True
             if stop:
                 break
+        if args.save_each_epoch and not stop:
+            epoch_dir = f"{out_dir}.epoch{ep + 1}"
+            model.save_pretrained(epoch_dir)
+            print(f"    epoch {ep + 1} LoRA checkpoint 已保存: {epoch_dir}")
         if stop:
             break
 

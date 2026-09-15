@@ -64,6 +64,23 @@ class ParallelEvalSuiteTest(unittest.TestCase):
         self.assertTrue(any("实际 180 题" in error for error in errors))
         self.assertTrue(any("解析异常 1 题" in error for error in errors))
 
+    def test_summary_rejects_canonical_question_hash_mismatch(self):
+        tasks = [*BASE_TASKS, OMNI_TASK]
+        with tempfile.TemporaryDirectory() as directory:
+            expected = {}
+            for index, (task, filename, _) in enumerate(tasks):
+                actual_hash = f"{index + 1:064x}"
+                self._write_result(directory, filename, task,
+                                   question_hash=actual_hash)
+                expected[task] = actual_hash
+            expected["math_high"] = "f" * 64
+            _, errors = build_summary(
+                Path(directory), tasks, expected_n=400,
+                expected_seed=42, tag="test",
+                expected_suite_run_id="test-run",
+                expected_question_hashes=expected)
+        self.assertTrue(any("math_high: 题集哈希" in error for error in errors))
+
 
 if __name__ == "__main__":
     unittest.main()

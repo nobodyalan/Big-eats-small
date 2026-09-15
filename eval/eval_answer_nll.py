@@ -194,7 +194,7 @@ def main():
     parser.add_argument("--math_hi", default="4-5")
     parser.add_argument("--zip", default=ZIP_PATH)
     parser.add_argument("--max_len", type=int, default=1536)
-    parser.add_argument("--attn_impl", default="")
+    parser.add_argument("--attn_impl", default="flash_attention_2")
     parser.add_argument("--bridge_depth", type=int, default=1)
     parser.add_argument("--bridge_mlp_dim", type=int, default=4096)
     parser.add_argument("--large_start", type=int, required=True)

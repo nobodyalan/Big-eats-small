@@ -418,7 +418,8 @@ def plot_losses(train_ce_history, eval_history, path):
 # ╚══════════════════════════════════════════════════════════════════════════╝
 def main():
     parser = argparse.ArgumentParser(description="训练门控残差融合适配器")
-    parser.add_argument("--data", default="data/mix_all.jsonl")
+    parser.add_argument("--data", default="data/math_majority_v3_all.jsonl",
+                        help="训练+验证合并 JSONL；默认使用原题组隔离的 v3 数据")
     parser.add_argument("--max_samples", type=int, default=0, help="最多训练条数(0=全部; 评估集另算, 不被截断)")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--max_len", type=int, default=1024, help="单条最大 token 数(显存不足先调小)")
@@ -488,7 +489,8 @@ def main():
     parser.add_argument("--seed", type=int, default=None,
                         help="训练随机种子；None 使用 Config.seed")
     parser.add_argument("--eval_every", type=int, default=200, help="每隔 N 步对比一次 baseline/fusion loss")
-    parser.add_argument("--eval_samples", type=int, default=64, help="从数据里留出多少条作评估集")
+    parser.add_argument("--eval_samples", type=int, default=1999,
+                        help="从文件末尾留出的验证条数；v3 默认 1999")
     parser.add_argument("--eval_batch_size", type=int, default=8, help="评估时的 batch(越大评估越快)")
     parser.add_argument("--eval_max_samples", type=int, default=400,
                         help="每次评估最多用多少条(0=全部; 验证集大时应设小, 否则每步评估很慢)")
@@ -506,6 +508,9 @@ def main():
     parser.add_argument("--resume", default="", help="从已保存的旁路参数继续")
     parser.add_argument("--patience", type=int, default=0,
                         help="早停耐心: 连续 N 次评估 fusion loss 无改善就停(0=关闭)")
+    parser.add_argument("--save_each_epoch", type=int, choices=(0, 1), default=0,
+                        help=("1=每个完整 epoch 另存不可变 checkpoint，供训练后用"
+                              "自由生成正确率选择；默认 0"))
     parser.add_argument("--plot", default=None,
                         help="loss 图路径(默认=自动带层范围+时间戳; 传空字符串=不画)")
     parser.add_argument("--attn_impl", default="",
@@ -635,9 +640,15 @@ def main():
     if use_lora_delay:
         for p in small_lora_params:
             p.requires_grad_(False)
-    use_branch_warmup = (not args.resume and fusion.gate_mode == "rezero"
+    freeze_branch_scale = args.alpha_lr == 0
+    use_branch_warmup = (not freeze_branch_scale and not args.resume
+                         and fusion.gate_mode == "rezero"
                          and args.branch_warmup_steps > 0)
     if use_branch_warmup:
+        scale_param.requires_grad_(False)
+    elif freeze_branch_scale:
+        # lr=0 不仅数值上不更新，也明确冻结参数。这样不会白算 alpha 梯度，
+        # health 日志也不会把固定的历史门控误报成“正在训练”。
         scale_param.requires_grad_(False)
     scale_params = [scale_param]
     params = bridge_params + small_lora_params + scale_params
@@ -659,7 +670,10 @@ def main():
     print("优化器参数组: " + " | ".join(
         f"{g['name']} lr={g['lr']:.2e} wd={g['weight_decay']:g}"
         for g in param_groups))
-    if use_branch_warmup:
+    if freeze_branch_scale:
+        print(f"旁路 scale 已冻结: {float(fusion.scale().detach()):.5f} "
+              "(alpha_lr=0，保留 resume 检查点取值)")
+    elif use_branch_warmup:
         print(f"旁路 warmup: 前 {args.branch_warmup_steps} step 固定 "
               f"branch_alpha={args.branch_warmup_alpha:g}，随后释放 alpha")
     elif args.resume and args.branch_warmup_steps > 0:
@@ -927,6 +941,10 @@ def main():
                     stop = True
             if stop:
                 break
+        if args.save_each_epoch and not stop:
+            epoch_path = f"{out_path}.epoch{ep + 1}"
+            save_fusion_experiment(fusion, epoch_path, small_lora_model)
+            print(f"    epoch {ep + 1} checkpoint 已保存: {epoch_path}")
         if stop:
             break
 

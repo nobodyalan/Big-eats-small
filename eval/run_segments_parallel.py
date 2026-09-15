@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """在同一张可见 GPU 上并行运行固定数学评测套件。
 
-默认保持旧版三档兼容；加 ``--include_omni_math`` 后并行运行四档：
-GSM8K、MATH L1-3、MATH L4-5、Omni-MATH rule L1-10。每档写入一个
+默认并行运行四档：GSM8K、MATH L1-3、MATH L4-5、Omni-MATH rule L3-8。
+传 ``--no_omni_math`` 可显式退回旧版三档。每档写入一个
 固定文件名，全部结束后核验样本数、seed、题集哈希和 Math-Verify 状态，
 再生成一个便于查看的 ``summary.txt``。
 """
@@ -31,6 +31,12 @@ BASE_TASKS = (
 OMNI_TASK = (
     "omni_math", "04_omni_math.json", ("--bench", "omni_math"),
 )
+CANONICAL_FOUR_TIER_HASHES = {
+    "gsm8k": "1065d53375c218c943ec9ff0b613b6c419489c687152c4281f07d2de04ca4e4b",
+    "math_low": "a4271ff9a3d511916ba287335012ea83d93db03b73bd619d7a43f8e669b43321",
+    "math_high": "6928ac2a9635de972bf4ef9e292c54f9c0d4396691678efebacc62b63841fe21",
+    "omni_math": "188267ee1bd96592b488d4c005f635a735004401f00a0f444d465d3d9605bf7e",
+}
 
 
 def option_value(arguments: list[str], option: str, default=None):
@@ -80,7 +86,8 @@ def metric_from_payload(payload: dict, task_name: str) -> dict:
 
 
 def build_summary(out_dir: Path, tasks, expected_n: int, expected_seed: int,
-                  tag: str, expected_suite_run_id: str = "") -> tuple[str, list[str]]:
+                  tag: str, expected_suite_run_id: str = "",
+                  expected_question_hashes: dict | None = None) -> tuple[str, list[str]]:
     """读取固定结果文件，返回人读摘要和所有一致性错误。"""
     errors: list[str] = []
     rows = []
@@ -113,6 +120,11 @@ def build_summary(out_dir: Path, tasks, expected_n: int, expected_seed: int,
                     f"{task_name}: suite_run_id 不属于本轮，可能读到了旧结果")
             if len(question_hash) != 64:
                 errors.append(f"{task_name}: question_set_sha256 缺失或无效")
+            expected_hash = (expected_question_hashes or {}).get(task_name)
+            if expected_hash and question_hash != expected_hash:
+                errors.append(
+                    f"{task_name}: 题集哈希 {question_hash} 与固定协议 "
+                    f"{expected_hash} 不一致")
             rows.append((task_name, filename, metric))
             question_hashes[task_name] = question_hash
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
@@ -159,8 +171,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="同一模型的三/四档数学评测并行启动器")
     parser.add_argument("--out_dir", required=True, help="结果 JSON 的共同目录")
     parser.add_argument("--tag", required=True, help="摘要中的实验标签")
-    parser.add_argument("--include_omni_math", action="store_true",
-                        help="增加 Omni-MATH rule，形成四档评测")
+    omni_group = parser.add_mutually_exclusive_group()
+    omni_group.add_argument("--include_omni_math", dest="include_omni_math",
+                            action="store_true", help="运行 Omni-MATH（默认）")
+    omni_group.add_argument("--no_omni_math", dest="include_omni_math",
+                            action="store_false", help="显式退回旧版三档评测")
+    parser.set_defaults(include_omni_math=True)
     parser.add_argument("--summary_path", default="",
                         help="摘要文件；默认 <out_dir>/summary.txt")
     parser.add_argument("--quiet", action="store_true",
@@ -185,7 +201,7 @@ def main() -> None:
         parser.error("以下参数由并行启动器管理，不要重复传入: " + ", ".join(conflicts))
 
     try:
-        limit = int(option_value(forwarded, "--limit", 200))
+        limit = int(option_value(forwarded, "--limit", 400))
         seed = int(option_value(forwarded, "--seed", 42))
         omni_per_level = int(option_value(forwarded, "--omni_limit_per_level", 0))
     except ValueError as exc:
@@ -193,8 +209,8 @@ def main() -> None:
     if limit <= 0:
         parser.error("并行套件要求 --limit 为正数，以便校验每档题数")
     if args.include_omni_math:
-        if option_value(forwarded, "--math_judge", "legacy") != "both":
-            parser.error("四档正式评测必须传 --math_judge both")
+        if option_value(forwarded, "--math_judge", "both") != "both":
+            parser.error("四档正式评测固定使用 --math_judge both")
         if omni_per_level != 0:
             parser.error(
                 "四档正式评测禁止 --omni_limit_per_level；它会把总题数变成每级题数之和")
@@ -263,9 +279,18 @@ def main() -> None:
             f"{name}={code} (日志 {path})" for name, code, path in failed)
         raise SystemExit(f"部分档位评测失败: {details}")
 
+    is_canonical_protocol = (
+        args.include_omni_math
+        and limit == 400 and seed == 42 and omni_per_level == 0
+        and option_value(forwarded, "--math_lo", "1-3") == "1-3"
+        and option_value(forwarded, "--math_hi", "4-5") == "4-5"
+        and option_value(forwarded, "--omni_levels", "3-8") == "3-8"
+    )
     report, validation_errors = build_summary(
         out_dir, tasks, expected_n=limit, expected_seed=seed, tag=args.tag,
-        expected_suite_run_id=suite_run_id)
+        expected_suite_run_id=suite_run_id,
+        expected_question_hashes=(CANONICAL_FOUR_TIER_HASHES
+                                  if is_canonical_protocol else None))
     atomic_write_text(summary_path, report)
     print("\n" + report, end="", flush=True)
     print(f"摘要已保存: {summary_path}", flush=True)

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "name": "math_majority_v3_group_disjoint",
+  "path": "data/math_majority_v3_all.jsonl",
+  "train_path": "data/math_majority_v3_train.jsonl",
+  "val_path": "data/math_majority_v3_val.jsonl",
+  "manifest": "data/math_majority_v3_manifest.json",
+  "recipe": "metamath_math_majority_v3_group_disjoint",
+  "split_policy": "all variants of one normalized original_question stay in one split; final eval_samples records are validation",
+  "external_test_policy": "normalized original questions from MATH test, GSM8K test, and Omni-MATH rule test are blocked from both train and validation",
+  "notes": "Run scripts/prepare_data.py --skip_zh --skip_mix first so converted MetaMathQA rows contain original_question metadata."
+}

@@ -18,7 +18,7 @@
     "--limit", "400", "--seed", "42", "--math_lo", "1-3",
     "--math_hi", "4-5", "--max_new", "1536",
     "--omni_path", "data/omni_math_rule_test.jsonl",
-    "--omni_levels", "1-10",
+    "--omni_levels", "3-8",
     "--math_judge", "both", "--save_raw_output",
     "--attn_impl", "flash_attention_2", "--fusion_only",
     "--lora_ckpt", {

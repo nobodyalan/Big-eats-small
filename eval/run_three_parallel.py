@@ -54,7 +54,7 @@ def main():
     parser.add_argument("--max_new", type=int, default=1536)
     parser.add_argument("--math_level", type=int, default=0, help="只测 MATH 指定难度(0=全部)")
     parser.add_argument("--omni_path", default="data/omni_math_rule_test.jsonl")
-    parser.add_argument("--omni_levels", default="5-10")
+    parser.add_argument("--omni_levels", default="3-8")
     parser.add_argument("--omni_limit_per_level", type=int, default=0)
     parser.add_argument("--out_dir", default="eval_results")
     parser.add_argument("--tag", default="", help="汇总表文件名标签")

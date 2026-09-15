@@ -345,7 +345,16 @@ class GatedResidualFusion(nn.Module):
         mask_kwargs = dict(config=sm.config, inputs_embeds=x,
                            attention_mask=None, cache_position=cache_position,
                            past_key_values=None, position_ids=pos_ids)
-        mask_map = {"full_attention": create_causal_mask(**mask_kwargs)}
+        try:
+            full_mask = create_causal_mask(**mask_kwargs)
+        except TypeError as exc:
+            # Transformers 5.3 的 mask helper 接受 cache_position，后续版本改为
+            # 从 position_ids 推导。只对明确的签名差异回退，不能吞掉函数内部异常。
+            if "cache_position" not in str(exc):
+                raise
+            mask_kwargs.pop("cache_position")
+            full_mask = create_causal_mask(**mask_kwargs)
+        mask_map = {"full_attention": full_mask}
         if getattr(sm, "has_sliding_layers", False):
             mask_map["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
         layer_types = getattr(sm.config, "layer_types", None)

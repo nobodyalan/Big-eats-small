@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "experiment_key": "deepbridge_small_lora/qwen3_4b__qwen3_06b/depth2_middle_l12-24_s9-19_r32/seed42",
+  "direction": "deepbridge_small_lora",
+  "model_group": "qwen3_4b__qwen3_06b",
+  "variant": "depth2_middle_l12-24_s9-19_r32",
+  "name": "eval_deepbridge_small_lora_r32_seed42_four_tier_n400",
+  "description": "Four-tier generation evaluation for the continued depth-2 bridge plus small-model LoRA",
+  "program": "eval/run_segments_parallel.py",
+  "gpu": 1,
+  "env": {"PYTHONUNBUFFERED": "1"},
+  "args": {
+    "out_dir": "eval_results/deepbridge_small_lora/qwen3_4b__qwen3_06b/depth2_middle_l12-24_s9-19_r32/seed42",
+    "tag": "deepbridge_small_lora_r32_seed42_n400_omni_l3-8",
+    "include_omni_math": true,
+    "quiet": true
+  },
+  "passthrough": [
+    "--limit", "400", "--seed", "42", "--math_lo", "1-3",
+    "--math_hi", "4-5", "--max_new", "1536",
+    "--omni_path", "data/omni_math_rule_test.jsonl",
+    "--omni_levels", "3-8",
+    "--math_judge", "both", "--save_raw_output",
+    "--attn_impl", "flash_attention_2", "--fusion_only",
+    "--bridge_depth", "2", "--bridge_mlp_dim", "4096",
+    "--large_start", "12", "--large_end", "24",
+    "--small_start", "9", "--small_end", "18",
+    "--ckpt", {
+      "first_existing": [
+        "models/trained/deepbridge_small_lora/qwen3_4b__qwen3_06b/depth2_middle_l12-24_s9-19_r32/seed42/adapter.pt.best_useful",
+        "models/trained/deepbridge_small_lora/qwen3_4b__qwen3_06b/depth2_middle_l12-24_s9-19_r32/seed42/adapter.pt.best",
+        "models/trained/deepbridge_small_lora/qwen3_4b__qwen3_06b/depth2_middle_l12-24_s9-19_r32/seed42/adapter.pt"
+      ]
+    },
+    "--small_lora_ckpt", {
+      "first_existing": [
+        "models/trained/deepbridge_small_lora/qwen3_4b__qwen3_06b/depth2_middle_l12-24_s9-19_r32/seed42/adapter.pt.best_useful.small_lora",
+        "models/trained/deepbridge_small_lora/qwen3_4b__qwen3_06b/depth2_middle_l12-24_s9-19_r32/seed42/adapter.pt.best.small_lora",
+        "models/trained/deepbridge_small_lora/qwen3_4b__qwen3_06b/depth2_middle_l12-24_s9-19_r32/seed42/adapter.pt.small_lora"
+      ]
+    }
+  ],
+  "required_paths": [
+    "data/.cache/math/MATH.zip",
+    "data/.cache/gsm8k_test.parquet",
+    "data/omni_math_rule_test.jsonl"
+  ],
+  "required_any_paths": [
+    [
+      "models/trained/deepbridge_small_lora/qwen3_4b__qwen3_06b/depth2_middle_l12-24_s9-19_r32/seed42/adapter.pt.best_useful",
+      "models/trained/deepbridge_small_lora/qwen3_4b__qwen3_06b/depth2_middle_l12-24_s9-19_r32/seed42/adapter.pt.best",
+      "models/trained/deepbridge_small_lora/qwen3_4b__qwen3_06b/depth2_middle_l12-24_s9-19_r32/seed42/adapter.pt"
+    ],
+    [
+      "models/trained/deepbridge_small_lora/qwen3_4b__qwen3_06b/depth2_middle_l12-24_s9-19_r32/seed42/adapter.pt.best_useful.small_lora",
+      "models/trained/deepbridge_small_lora/qwen3_4b__qwen3_06b/depth2_middle_l12-24_s9-19_r32/seed42/adapter.pt.best.small_lora",
+      "models/trained/deepbridge_small_lora/qwen3_4b__qwen3_06b/depth2_middle_l12-24_s9-19_r32/seed42/adapter.pt.small_lora"
+    ]
+  ],
+  "log_path": "logs/deepbridge_small_lora/qwen3_4b__qwen3_06b/depth2_middle_l12-24_s9-19_r32/seed42/eval.log",
+  "resolved_config_path": "eval_results/deepbridge_small_lora/qwen3_4b__qwen3_06b/depth2_middle_l12-24_s9-19_r32/seed42/resolved_config.json"
+}

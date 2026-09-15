@@ -119,10 +119,27 @@ def convert_zh(src: str, out: str, force: bool):
 
 
 def convert_metamath(src: str, math_out: str, gsm8k_out: str, force: bool):
-    """把 MetaMathQA-395K.json 按 type 拆成 MATH 池与 GSM8K 池, 转 prompt/response"""
-    if os.path.exists(math_out) and os.path.exists(gsm8k_out) and not force:
-        print(f"  已存在, 跳过转换: {math_out} / {gsm8k_out}")
-        return
+    """把 MetaMathQA 拆成 MATH/GSM8K 池，并保留原题分组元数据。
+
+    ``original_question`` 是后续 train/val/test 原题级隔离的稳定分组键；不能只
+    保存改写后的 ``query``，否则同一原题的不同 MetaMathQA 变体会被错误地分到
+    训练集和验证集两侧。
+    """
+    outputs_exist = os.path.exists(math_out) and os.path.exists(gsm8k_out)
+
+    def has_group_metadata(path):
+        try:
+            with open(path, encoding="utf-8") as stream:
+                first = json.loads(next(line for line in stream if line.strip()))
+            return bool(first.get("original_question")) and bool(first.get("meta_type"))
+        except (OSError, StopIteration, json.JSONDecodeError):
+            return False
+
+    if outputs_exist and not force:
+        if has_group_metadata(math_out) and has_group_metadata(gsm8k_out):
+            print(f"  已存在且含原题元数据, 跳过转换: {math_out} / {gsm8k_out}")
+            return
+        print("  发现旧版转换文件缺少 original_question，将从本地 raw 自动重建")
     print(f"  转换 MetaMathQA: {src} → MATH 池 + GSM8K 池")
     data = json.load(open(src, encoding="utf-8"))
     mw = gw = 0
@@ -134,8 +151,13 @@ def convert_metamath(src: str, math_out: str, gsm8k_out: str, force: bool):
             a = (r.get("response") or "").strip()
             if not q or not a:
                 continue
-            line = json.dumps({"prompt": INSTRUCTION + q, "response": a},
-                              ensure_ascii=False) + "\n"
+            original_question = (r.get("original_question") or q).strip()
+            line = json.dumps({
+                "prompt": INSTRUCTION + q,
+                "response": a,
+                "original_question": original_question,
+                "meta_type": t,
+            }, ensure_ascii=False) + "\n"
             if t.startswith("MATH"):
                 fm.write(line)
                 mw += 1

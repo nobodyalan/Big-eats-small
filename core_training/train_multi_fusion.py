@@ -155,7 +155,8 @@ def parse_args():
     parser.add_argument("--downstream_ckpt", default="",
                         help="可选；默认让新增下游 Bridge 从相同随机初始化开始")
     parser.add_argument("--resume", default="", help="恢复本脚本保存的双 Bridge checkpoint")
-    parser.add_argument("--data", default="data/math_majority_all.jsonl")
+    parser.add_argument("--data", default="data/math_majority_v3_all.jsonl",
+                        help="训练+验证合并 JSONL；默认使用原题组隔离的 v3 数据")
     parser.add_argument("--max_samples", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -185,6 +186,9 @@ def parse_args():
     parser.add_argument("--eval_max_samples", type=int, default=400)
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--patience", type=int, default=0)
+    parser.add_argument("--save_each_epoch", type=int, choices=(0, 1), default=0,
+                        help=("1=每个完整 epoch 另存不可变双 Bridge checkpoint，供"
+                              "训练后用自由生成正确率选择；默认 0"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out", required=True)
     parser.add_argument("--plot", default="")
@@ -473,6 +477,10 @@ def main():
                     stop = True
             if stop:
                 break
+        if args.save_each_epoch and not stop:
+            epoch_path = f"{args.out}.epoch{epoch + 1}"
+            checkpoint(epoch_path, eval_history[-1] if eval_history else None)
+            print(f"    epoch {epoch + 1} checkpoint 已保存: {epoch_path}")
         if stop:
             break
 

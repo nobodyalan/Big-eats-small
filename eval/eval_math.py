@@ -9,7 +9,7 @@ MATH test 划分评测: 融合 vs baseline 的最终答案准确率
 对比: 同一道题分别用 旁路开(fusion) 与 旁路关(baseline) 生成, 统计各自准确率。
 
 用法(在 BES 目录下执行):
-  python eval/eval_math.py --ckpt cache/fusion_adapter.pt --limit 200          # 随机 200 题
+  python eval/eval_math.py --ckpt cache/fusion_adapter.pt                      # 默认 400 题
   python eval/eval_math.py --ckpt cache/fusion_adapter.pt --limit 0            # 全量 5000 题
   python eval/eval_math.py --ckpt cache/fusion_adapter.pt --limit 200 --fusion_only
   python eval/eval_math.py --bench segments --segment_only math_hi --limit 200 # 只跑高难档
@@ -450,6 +450,69 @@ def load_aime_test(seed: int, limit: int):
 
 # ────────────────────────── Omni-MATH 数据 ──────────────────────────
 OMNI_MATH_PATH = "data/omni_math_rule_test.jsonl"
+SFT_VAL_PATH = "data/math_majority_v3_val.jsonl"
+
+
+def _strip_sft_instruction(prompt: str) -> str:
+    prefix = ("Solve the following math problem step by step, and put your final "
+              "answer in \\boxed{...}:\n\n")
+    prompt = str(prompt or "").strip()
+    return prompt[len(prefix):].strip() if prompt.startswith(prefix) else prompt
+
+
+def load_sft_validation(path: str, seed: int, limit: int,
+                        limit_per_stratum: int = 0):
+    """读取严格隔离的 SFT val，并作确定性分层抽样。
+
+    v3 验证集由 official MATH L1--L5 与 MetaMathQA GSM8K 组成，因此默认
+    strata 是 ``math_L1`` ... ``math_L5`` 和 ``gsm8k``。
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"缺少 SFT 验证集: {path}")
+    items = []
+    with open(path, encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            problem = _strip_sft_instruction(row.get("prompt", row.get("problem", "")))
+            response = str(row.get("response", row.get("solution", "")))
+            gold = extract_boxed(response) or extract_math_marker_answer(response)
+            source = str(row.get("source", "unknown"))
+            level = row.get("level")
+            if "GSM" in source.upper():
+                stratum = "gsm8k"
+            elif level is not None:
+                stratum = f"math_L{level}"
+            else:
+                stratum = source
+            if not problem or gold is None:
+                continue
+            items.append({
+                "benchmark_id": row.get(
+                    "id", "sft_val_" + hashlib.sha1(
+                        f"{line_number}:{problem}".encode("utf-8")).hexdigest()[:12]),
+                "problem": problem,
+                "answer": gold,
+                "source": source,
+                "level": level,
+                "stratum": stratum,
+                "original_question": row.get("original_question"),
+            })
+    rng = random.Random(seed)
+    if limit_per_stratum > 0:
+        grouped = {}
+        for row in items:
+            grouped.setdefault(row["stratum"], []).append(row)
+        selected = []
+        for stratum in sorted(grouped):
+            pool = grouped[stratum]
+            rng.shuffle(pool)
+            selected.extend(pool[:limit_per_stratum])
+        rng.shuffle(selected)
+        return selected
+    rng.shuffle(items)
+    return items[:limit] if limit > 0 else items
 
 
 # ────────────────────────────── 主流程 ──────────────────────────────
@@ -481,13 +544,14 @@ def main():
     parser.add_argument("--lora_device", default="", help="LoRA 模型设备(空=自动另一张卡)")
     parser.add_argument("--bench", default="both",
                         choices=["math", "gsm8k", "both", "aime", "omni_math",
-                                 "segments"],
-                        help="评测哪个数据集(math/gsm8k/both/aime/omni_math/segments)")
-    parser.add_argument("--limit", type=int, default=200, help="每个数据集最多评测多少题(0=全部)")
+                                 "segments", "sft_val"],
+                        help=("评测哪个数据集(math/gsm8k/both/aime/omni_math/"
+                              "segments/sft_val)"))
+    parser.add_argument("--limit", type=int, default=400, help="每个数据集最多评测多少题(0=全部)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_new", type=int, default=1536)
-    parser.add_argument("--attn_impl", default="",
-                        help="4B 注意力实现；正式评测应与训练一致")
+    parser.add_argument("--attn_impl", default="flash_attention_2",
+                        help="4B 注意力实现；默认固定为 flash_attention_2")
     parser.add_argument("--zip", default=ZIP_PATH)
     parser.add_argument("--math_level", type=int, default=0,
                         help="只测 MATH 指定难度(1~5, 0=全部)")
@@ -497,10 +561,15 @@ def main():
                         help="segments 模式下 MATH 高级区间(如 4-5 / 5)")
     parser.add_argument("--omni_path", default=OMNI_MATH_PATH,
                         help="规范化 Omni-MATH JSONL（默认官方 rule 子集）")
-    parser.add_argument("--omni_levels", default="5-10",
-                        help="Omni-MATH 难度，如 1-10 / 5-10 / 7,8,9；默认 5-10")
+    parser.add_argument("--omni_levels", default="3-8",
+                        help="Omni-MATH 难度，如 1-10 / 3-8 / 7,8；正式默认 3-8")
     parser.add_argument("--omni_limit_per_level", type=int, default=0,
                         help="每个难度抽取题数；>0 时覆盖 --limit，供等级 pilot 使用")
+    parser.add_argument("--sft_val_path", default=SFT_VAL_PATH,
+                        help="原题组严格隔离的 SFT 验证集 JSONL")
+    parser.add_argument("--sft_val_limit_per_stratum", type=int, default=0,
+                        help=("SFT val 每个层级抽取题数；>0 时覆盖 --limit。"
+                              "v3 通常有 math_L1..L5、gsm8k 六层"))
     parser.add_argument(
         "--segment_only", default="all",
         choices=["all", "gsm8k", "math_lo", "math_hi"],
@@ -542,6 +611,8 @@ def main():
         parser.error("--segment_only 仅可与 --bench segments 一起使用")
     if args.omni_limit_per_level < 0:
         parser.error("--omni_limit_per_level 必须 >= 0")
+    if args.sft_val_limit_per_stratum < 0:
+        parser.error("--sft_val_limit_per_stratum 必须 >= 0")
     if args.result_path and (
             args.bench == "both"
             or (args.bench == "segments" and args.segment_only == "all")):
@@ -588,6 +659,16 @@ def main():
             raise SystemExit(f"[错误] Omni-MATH 数据无效: {exc}") from exc
         level_name = args.omni_levels.replace(",", "_").replace(" ", "")
         benches.append((f"OMNI_MATH_L{level_name}", omni_items,
+                        lambda r: str(r.get("answer", "")).strip(),
+                        extract_boxed, answers_equal))
+    if args.bench == "sft_val":
+        try:
+            sft_items = load_sft_validation(
+                args.sft_val_path, args.seed, args.limit,
+                args.sft_val_limit_per_stratum)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"[错误] SFT 验证集无效: {exc}") from exc
+        benches.append(("SFT_VAL", sft_items,
                         lambda r: str(r.get("answer", "")).strip(),
                         extract_boxed, answers_equal))
     if args.bench == "segments":
@@ -761,7 +842,8 @@ def main():
                         rec[f"{label}_math_verify_error"] = judged["error"]
 
             # Omni-MATH 的分层信息进入逐题结果，供难度选择与领域诊断使用。
-            for field in ("difficulty", "difficulty_band", "domain", "source"):
+            for field in ("difficulty", "difficulty_band", "domain", "source",
+                          "level", "stratum", "original_question"):
                 if field in r:
                     rec[field] = r[field]
 
@@ -913,6 +995,53 @@ def main():
                     if f"{label}_acc" in part:
                         values.append(f"{label}={part[f'{label}_acc']:.2%}")
                 print(f"  L{level} n={part['n']}: " + " | ".join(values))
+        if name == "SFT_VAL":
+            by_stratum = {}
+            for row in results:
+                stratum = str(row.get("stratum", "unknown"))
+                part = by_stratum.setdefault(stratum, {"n": 0})
+                part["n"] += 1
+                for label in ("baseline", "fusion", "lora"):
+                    for suffix in ("correct", "math_verify_correct"):
+                        key = f"{label}_{suffix}"
+                        if key in row:
+                            part[key] = part.get(key, 0) + int(bool(row[key]))
+            for part in by_stratum.values():
+                for key, value in list(part.items()):
+                    if key != "n" and key.endswith("correct"):
+                        part[key.replace("correct", "acc")] = round(
+                            value / part["n"], 4) if part["n"] else 0.0
+            summary["by_stratum"] = dict(sorted(by_stratum.items()))
+            for label in ("baseline", "fusion", "lora"):
+                preferred_key = f"{label}_math_verify_acc"
+                fallback_key = f"{label}_acc"
+                values = [
+                    part[preferred_key] if preferred_key in part else part[fallback_key]
+                    for part in summary["by_stratum"].values()
+                    if preferred_key in part or fallback_key in part
+                ]
+                if values:
+                    summary[f"{label}_macro_acc"] = round(
+                        sum(values) / len(values), 4)
+            summary["recommended_selection_metric"] = (
+                "math_verify_macro_accuracy_across_strata")
+            print("[SFT_VAL] 分层结果:")
+            for stratum, part in summary["by_stratum"].items():
+                values = []
+                for label in ("baseline", "fusion", "lora"):
+                    key = f"{label}_math_verify_acc"
+                    fallback = f"{label}_acc"
+                    if key in part:
+                        values.append(f"{label}={part[key]:.2%}")
+                    elif fallback in part:
+                        values.append(f"{label}={part[fallback]:.2%}")
+                print(f"  {stratum} n={part['n']}: " + " | ".join(values))
+            macro_values = [
+                f"{label}={summary[f'{label}_macro_acc']:.2%}"
+                for label in ("baseline", "fusion", "lora")
+                if f"{label}_macro_acc" in summary
+            ]
+            print("[SFT_VAL] 分层宏平均: " + " | ".join(macro_values))
         if results and "fusion_pred" in results[0] and "baseline_pred" in results[0]:
             n_diff = sum(1 for x in results if x.get("fusion_pred") != x.get("baseline_pred"))
             summary["n_answer_changed"] = n_diff
@@ -947,6 +1076,8 @@ def main():
                        "omni_path": args.omni_path,
                        "omni_levels": args.omni_levels,
                        "omni_limit_per_level": args.omni_limit_per_level,
+                       "sft_val_path": args.sft_val_path,
+                       "sft_val_limit_per_stratum": args.sft_val_limit_per_stratum,
                        "diagnose_math_format": args.diagnose_math_format,
                        "math_judge": args.math_judge,
                        "math_verify_version": (
