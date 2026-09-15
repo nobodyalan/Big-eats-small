@@ -138,6 +138,28 @@ class MultiFusionRuntimeTests(unittest.TestCase):
                                 for module in norms))
             self.assertTrue(all(not module.weight.requires_grad for module in norms))
 
+    def test_eval_loader_can_attach_each_bridge_to_a_distinct_small_model(self):
+        _, _, upstream, downstream = self.make_pair()
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "multi.pt")
+            save_multi_fusion(
+                {"upstream": upstream, "downstream": downstream}, path,
+                {"small_lora": {"mode": "independent"}})
+            payload = torch.load(path, map_location="cpu")
+        small_upstream, small_downstream, large = (
+            tiny_qwen(), tiny_qwen(), tiny_qwen())
+        restored, meta = attach_multi_fusion_checkpoint(
+            large,
+            {"upstream": small_upstream, "downstream": small_downstream},
+            payload)
+        self.assertEqual(meta["small_lora"]["mode"], "independent")
+        self.assertIs(restored["upstream"].small_model_ref,
+                      small_upstream.model)
+        self.assertIs(restored["downstream"].small_model_ref,
+                      small_downstream.model)
+        self.assertIsNot(restored["upstream"].small_model_ref,
+                         restored["downstream"].small_model_ref)
+
     def test_eval_generate_starts_and_ends_both_branch_caches(self):
         class CacheProbe:
             enabled = True

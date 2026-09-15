@@ -24,6 +24,7 @@ import re
 import sys
 import time
 import zipfile
+from collections.abc import Mapping
 from importlib.metadata import PackageNotFoundError, version as package_version
 
 import torch
@@ -336,8 +337,10 @@ def attach_multi_fusion_checkpoint(model_large, model_small, payload):
         branch_cfg.fusion_mlp_dim = int(saved_meta["mlp_dim"])
         branch_cfg.fusion_bridge_depth = int(saved_meta["bridge_depth"])
         branch_cfg.fusion_bypass_small = bool(saved_meta.get("bypass_small", False))
+        branch_small = (model_small[fusion_name]
+                        if isinstance(model_small, Mapping) else model_small)
         fusion_map[fusion_name] = attach_fusion(
-            model_large, model_small, branch_cfg, name=fusion_name)
+            model_large, branch_small, branch_cfg, name=fusion_name)
     if (fusion_map["upstream"].injection_mode == "span"
             and fusion_map["downstream"].injection_mode == "span"
             and fusion_map["upstream"].l2 >= fusion_map["downstream"].l1):
@@ -528,6 +531,10 @@ def main():
                               "位置/深度/MLP 维度从 checkpoint 自动恢复"))
     parser.add_argument("--small_lora_ckpt", default="",
                         help="与 fusion 配套的小模型 LoRA 目录")
+    parser.add_argument("--upstream_small_lora_ckpt", default="",
+                        help="双 Bridge 上游专属 small LoRA；通常由 checkpoint 自动定位")
+    parser.add_argument("--downstream_small_lora_ckpt", default="",
+                        help="双 Bridge 下游专属 small LoRA；通常由 checkpoint 自动定位")
     parser.add_argument("--bridge_depth", type=int, default=1,
                         help="fusion bridge 深度，必须与 checkpoint 一致")
     parser.add_argument("--bridge_mlp_dim", type=int, default=None,
@@ -610,7 +617,9 @@ def main():
             args.small_start, args.small_end, args.large_start, args.large_end)):
         parser.error("多 Bridge 的层位置来自 checkpoint，不要再传单 Bridge 层号")
     if args.baseline_only and (args.ckpt or args.multi_fusion_ckpt
-                               or args.small_lora_ckpt or args.lora_ckpt):
+                               or args.small_lora_ckpt or args.lora_ckpt
+                               or args.upstream_small_lora_ckpt
+                               or args.downstream_small_lora_ckpt):
         parser.error("--baseline_only 不应同时传入实验 checkpoint")
     if args.segment_only != "all" and args.bench != "segments":
         parser.error("--segment_only 仅可与 --bench segments 一起使用")
@@ -728,7 +737,7 @@ def main():
     fusions = []
     multi_payload = None
     multi_meta = None
-    small_lora_model = None
+    small_lora_models = {}
 
     def _resolve_dev(pref: str, fallback: str) -> str:
         d = pref or fallback
@@ -743,14 +752,27 @@ def main():
         small_path = resolve_model_path(cfg.model_small_id, cfg.model_small_local)
         tokenizer = AutoTokenizer.from_pretrained(large_path)
         fdev = _resolve_dev(args.fusion_device, "cuda:0")
-        small = AutoModelForCausalLM.from_pretrained(small_path, dtype=dt).to(fdev).eval()
+        small = AutoModelForCausalLM.from_pretrained(
+            small_path, dtype=dt).to(fdev).eval()
         large_f = AutoModelForCausalLM.from_pretrained(
             large_path, dtype=dt, **attn_kwargs).to(fdev).eval()
         if args.multi_fusion_ckpt:
             multi_payload = torch.load(args.multi_fusion_ckpt, map_location="cpu")
+            saved_multi_meta = multi_payload.get("meta", {})
+            saved_lora_meta = (saved_multi_meta.get("small_lora", {})
+                               if isinstance(saved_multi_meta, dict) else {})
+            independent_lora = saved_lora_meta.get("mode") == "independent"
+            if independent_lora:
+                small_models = {
+                    "upstream": small,
+                    "downstream": AutoModelForCausalLM.from_pretrained(
+                        small_path, dtype=dt).to(fdev).eval(),
+                }
+            else:
+                small_models = small
             try:
                 fusion_map, multi_meta = attach_multi_fusion_checkpoint(
-                    large_f, small, multi_payload)
+                    large_f, small_models, multi_payload)
             except ValueError as exc:
                 raise SystemExit(f"[错误] {args.multi_fusion_ckpt}: {exc}") from exc
             required_names = ("upstream", "downstream")
@@ -761,23 +783,42 @@ def main():
                 for name in required_names)
             print(f"双 Bridge scales: {scales} | meta={multi_meta} (设备 {fdev})")
             del multi_payload
-            lora_meta = multi_meta.get("small_lora", {}) if isinstance(multi_meta, dict) else {}
-            paired_lora = args.small_lora_ckpt
-            if not paired_lora and lora_meta.get("enabled"):
-                paired_lora = args.multi_fusion_ckpt + str(
-                    lora_meta.get("suffix", ".small_lora"))
-            if paired_lora:
-                if not os.path.isdir(paired_lora):
-                    raise SystemExit(
-                        "[错误] 双 Bridge checkpoint 声明使用共享 small LoRA，但配套目录不存在: "
-                        f"{paired_lora}")
+            lora_meta = (multi_meta.get("small_lora", {})
+                         if isinstance(multi_meta, dict) else {})
+            if lora_meta.get("mode") == "independent":
                 from peft import PeftModel
-                # 两条 fusion 保存的 layer 引用指向同一个 small base；PEFT 原地
-                # 替换并集层的线性模块，因此两条旁路会共同使用所加载的 LoRA。
-                small_lora_model = PeftModel.from_pretrained(
-                    small, paired_lora, is_trainable=False).eval()
-                args.small_lora_ckpt = paired_lora
-                print(f"已加载多 Bridge 共享 small LoRA: {paired_lora}")
+                branches = lora_meta.get("branches", {})
+                for name in required_names:
+                    branch_meta = branches.get(name, {})
+                    if not branch_meta.get("enabled"):
+                        continue
+                    explicit = getattr(args, f"{name}_small_lora_ckpt")
+                    paired = explicit or (args.multi_fusion_ckpt + str(
+                        branch_meta.get("suffix", f".{name}_small_lora")))
+                    if not os.path.isdir(paired):
+                        raise SystemExit(
+                            f"[错误] {name} Bridge 声明使用专属 small LoRA，"
+                            f"但配套目录不存在: {paired}")
+                    small_lora_models[name] = PeftModel.from_pretrained(
+                        small_models[name], paired, is_trainable=False).eval()
+                    setattr(args, f"{name}_small_lora_ckpt", paired)
+                    print(f"已加载 {name} 专属 small LoRA: {paired}")
+            else:
+                # 兼容尚未迁移的共享 LoRA checkpoint。
+                paired_lora = args.small_lora_ckpt
+                if not paired_lora and lora_meta.get("enabled"):
+                    paired_lora = args.multi_fusion_ckpt + str(
+                        lora_meta.get("suffix", ".small_lora"))
+                if paired_lora:
+                    if not os.path.isdir(paired_lora):
+                        raise SystemExit(
+                            "[错误] 双 Bridge checkpoint 声明使用共享 small LoRA，"
+                            f"但配套目录不存在: {paired_lora}")
+                    from peft import PeftModel
+                    small_lora_models["shared"] = PeftModel.from_pretrained(
+                        small, paired_lora, is_trainable=False).eval()
+                    args.small_lora_ckpt = paired_lora
+                    print(f"已加载旧版共享 small LoRA: {paired_lora}")
         else:
             fusion = attach_fusion(large_f, small, cfg)
             fusions = [fusion]
@@ -785,7 +826,7 @@ def main():
                 from peft import PeftModel
                 # attach_fusion 已保存底层真实层引用；PEFT 原地替换这些层中的线性模块，
                 # 因而手写的小模型片段 forward 会自动使用 LoRA。
-                small_lora_model = PeftModel.from_pretrained(
+                small_lora_models["single"] = PeftModel.from_pretrained(
                     small, args.small_lora_ckpt, is_trainable=False).eval()
             if args.ckpt:
                 load_fusion(fusion, args.ckpt)
@@ -1093,6 +1134,8 @@ def main():
                             for index, branch in enumerate(fusions)}
                            if args.multi_fusion_ckpt else None),
                        "small_lora_ckpt": args.small_lora_ckpt,
+                       "upstream_small_lora_ckpt": args.upstream_small_lora_ckpt,
+                       "downstream_small_lora_ckpt": args.downstream_small_lora_ckpt,
                        "lora_ckpt": args.lora_ckpt,
                        "suite_run_id": args.suite_run_id,
                        "small_start": args.small_start, "small_end": args.small_end,

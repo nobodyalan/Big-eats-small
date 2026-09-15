@@ -33,7 +33,6 @@
     "downstream_lr": 0.00001,
     "upstream_alpha_lr": 0.00005,
     "downstream_alpha_lr": 0.00005,
-    "small_lora_r": 0,
     "weight_decay": 0.01,
     "warmup_steps": 200,
     "branch_warmup_steps": 0,

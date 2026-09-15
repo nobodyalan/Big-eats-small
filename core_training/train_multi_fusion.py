@@ -5,9 +5,9 @@
   staged: 加载并冻结已经训练好的上游 Bridge，只训练新接入的下游 Bridge；
   joint:  使用完全相同的初始化，同时训练上游和下游 Bridge。
 
-两条旁路共享同一份 0.6B 基础权重（显存更省），各自拥有独立 adapter、
-branch alpha、hook 状态和生成 cache。可选 small LoRA 也在实际使用层的并集上
-共享，用于和“仅联合训练两个 Bridge”构成单变量对照。
+不训练 LoRA 时两条旁路可共享同一份冻结 0.6B 基础权重。启用 LoRA 时改用
+两份独立的 0.6B 实例：每条旁路各自拥有 adapter、branch alpha、small LoRA、
+hook 状态和生成 cache，避免两条路径通过共享 LoRA 隐式耦合。
 """
 
 from __future__ import annotations
@@ -178,18 +178,24 @@ def parse_args():
     parser.add_argument("--branch_alpha_max", type=float, default=0.25)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--alpha_grad_clip", type=float, default=0.1)
-    parser.add_argument("--small_lora_r", type=int, default=0,
-                        help="共享小模型在两条旁路层范围并集上的 LoRA rank；0=关闭")
-    parser.add_argument("--small_lora_alpha", type=int, default=0,
-                        help="共享小模型 LoRA alpha；0=自动 2×rank")
+    parser.add_argument("--upstream_small_lora_r", type=int, default=0,
+                        help="上游旁路专属 small LoRA rank；0=关闭")
+    parser.add_argument("--downstream_small_lora_r", type=int, default=0,
+                        help="下游旁路专属 small LoRA rank；0=关闭")
+    parser.add_argument("--upstream_small_lora_alpha", type=int, default=0,
+                        help="上游专属 LoRA alpha；0=自动 2×rank")
+    parser.add_argument("--downstream_small_lora_alpha", type=int, default=0,
+                        help="下游专属 LoRA alpha；0=自动 2×rank")
     parser.add_argument("--small_lora_dropout", type=float, default=0.05)
     parser.add_argument("--small_lora_target",
                         default="q_proj,k_proj,v_proj,o_proj")
-    parser.add_argument("--small_lora_lr", type=float, default=2e-5)
-    parser.add_argument("--small_lora_grad_clip", type=float, default=0.5)
+    parser.add_argument("--upstream_small_lora_lr", type=float, default=1e-5)
+    parser.add_argument("--downstream_small_lora_lr", type=float, default=2e-5)
+    parser.add_argument("--upstream_small_lora_grad_clip", type=float, default=0.5)
+    parser.add_argument("--downstream_small_lora_grad_clip", type=float, default=0.5)
     parser.add_argument("--small_lora_delay_steps", type=int, default=0)
-    parser.add_argument("--small_lora_resume", default="",
-                        help="可选：继续训练共享小模型 LoRA 目录")
+    parser.add_argument("--upstream_small_lora_resume", default="")
+    parser.add_argument("--downstream_small_lora_resume", default="")
     parser.add_argument("--grad_checkpoint", type=int, default=1)
     parser.add_argument("--attn_impl", default="flash_attention_2")
     parser.add_argument("--answer_weight", type=float, default=2.0)
@@ -216,6 +222,8 @@ def parse_args():
             parser.error(f"--{name} 必须 >= 0")
     if args.branch_alpha_max < 0:
         parser.error("--branch_alpha_max 必须 >= 0")
+    if args.upstream_small_lora_r < 0 or args.downstream_small_lora_r < 0:
+        parser.error("两条 --*_small_lora_r 必须 >= 0")
     if (args.branch_alpha_max > 0
             and abs(args.branch_warmup_alpha) > args.branch_alpha_max):
         parser.error("--branch_warmup_alpha 不能超过 --branch_alpha_max")
@@ -243,23 +251,43 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     attn_kwargs = {"attn_implementation": args.attn_impl} if args.attn_impl else {}
-    small = AutoModelForCausalLM.from_pretrained(small_path, dtype=dtype).cuda()
+    resume_has_independent_lora = bool(args.resume) and any(
+        os.path.isdir(args.resume + suffix) for suffix in
+        (".upstream_small_lora", ".downstream_small_lora"))
+    independent_lora = any((
+        args.upstream_small_lora_r > 0,
+        args.downstream_small_lora_r > 0,
+        bool(args.upstream_small_lora_resume),
+        bool(args.downstream_small_lora_resume),
+        resume_has_independent_lora,
+    ))
+    small_upstream = AutoModelForCausalLM.from_pretrained(
+        small_path, dtype=dtype).cuda()
+    # 独立 LoRA 必须有独立 base module；否则 PEFT 对线性层的原地包装会让
+    # downstream 也使用 upstream 的 LoRA，重新产生参数共享。
+    small_downstream = (AutoModelForCausalLM.from_pretrained(
+        small_path, dtype=dtype).cuda() if independent_lora else small_upstream)
     large = AutoModelForCausalLM.from_pretrained(
         large_path, dtype=dtype, **attn_kwargs).cuda()
-    for model in (small, large):
+    unique_models = {id(model): model for model in
+                     (small_upstream, small_downstream, large)}
+    for model in unique_models.values():
         for parameter in model.parameters():
             parameter.requires_grad_(False)
     large.train()
-    small.eval()
+    small_upstream.eval()
+    small_downstream.eval()
     if args.grad_checkpoint:
         large.gradient_checkpointing_enable()
         large.enable_input_require_grads()
         print("    梯度检查点已开启")
 
     upstream = attach_fusion(
-        large, small, config_for_position(base_cfg, upstream_name), name="upstream")
+        large, small_upstream, config_for_position(base_cfg, upstream_name),
+        name="upstream")
     downstream = attach_fusion(
-        large, small, config_for_position(base_cfg, downstream_name), name="downstream")
+        large, small_downstream, config_for_position(base_cfg, downstream_name),
+        name="downstream")
     fusions = {"upstream": upstream, "downstream": downstream}
     if upstream.l2 >= downstream.l1:
         raise ValueError("本程序要求上游注入点严格早于下游捕获点")
@@ -283,26 +311,50 @@ def main():
     if args.resume:
         load_multi_fusion(fusions, args.resume)
 
-    # 两条旁路共享同一份 0.6B，因此 LoRA 也显式共享；只覆盖实际会运行到的
-    # small layer 并集。middle+late 的并集为连续 S9~S26。
-    small_lora_model = None
-    if args.small_lora_r > 0 or args.small_lora_resume:
-        targets = [x.strip() for x in args.small_lora_target.split(",") if x.strip()]
-        if not targets:
-            raise ValueError("--small_lora_target 不能为空")
-        alpha = args.small_lora_alpha or 2 * max(1, args.small_lora_r)
-        resume_path = args.small_lora_resume
-        if not resume_path and args.resume and os.path.isdir(args.resume + ".small_lora"):
-            resume_path = args.resume + ".small_lora"
-        union_s1 = min(upstream.s1, downstream.s1)
-        union_s2 = max(upstream.s2, downstream.s2)
-        small_lora_model = attach_small_lora(
-            small, union_s1, union_s2, max(1, args.small_lora_r), alpha,
-            args.small_lora_dropout, targets, resume_path)
-        small_lora_model.train()
-        for fusion in fusions.values():
-            # 共享 LoRA 位于外部 small model 中，不在 fusion.parameters() 里。
-            fusion.external_trainable = True
+    targets = [x.strip() for x in args.small_lora_target.split(",") if x.strip()]
+    if independent_lora and not targets:
+        raise ValueError("--small_lora_target 不能为空")
+    lora_specs = {
+        "upstream": {
+            "base": small_upstream,
+            "fusion": upstream,
+            "rank": args.upstream_small_lora_r,
+            "alpha": args.upstream_small_lora_alpha,
+            "resume": args.upstream_small_lora_resume,
+            "lr": args.upstream_small_lora_lr,
+            "grad_clip": args.upstream_small_lora_grad_clip,
+            "suffix": ".upstream_small_lora",
+        },
+        "downstream": {
+            "base": small_downstream,
+            "fusion": downstream,
+            "rank": args.downstream_small_lora_r,
+            "alpha": args.downstream_small_lora_alpha,
+            "resume": args.downstream_small_lora_resume,
+            "lr": args.downstream_small_lora_lr,
+            "grad_clip": args.downstream_small_lora_grad_clip,
+            "suffix": ".downstream_small_lora",
+        },
+    }
+    small_lora_models = {}
+    for name, spec in lora_specs.items():
+        resume_path = spec["resume"]
+        if not resume_path and args.resume:
+            candidate = args.resume + spec["suffix"]
+            if os.path.isdir(candidate):
+                resume_path = candidate
+        enabled = spec["rank"] > 0 or bool(resume_path)
+        if not enabled:
+            continue
+        alpha = spec["alpha"] or 2 * max(1, spec["rank"])
+        model = attach_small_lora(
+            spec["base"], spec["fusion"].s1, spec["fusion"].s2,
+            max(1, spec["rank"]), alpha, args.small_lora_dropout,
+            targets, resume_path)
+        model.train()
+        small_lora_models[name] = model
+        # LoRA 在外部 small model 中，不属于 fusion.parameters()。
+        spec["fusion"].external_trainable = True
 
     downstream_warmup = (not args.resume and downstream.gate_mode == "rezero"
                          and args.branch_warmup_steps > 0)
@@ -316,14 +368,19 @@ def main():
     down_bridge = bridge_parameters(downstream)
     up_scale = [scale_parameter(upstream)] if joint else []
     down_scale = [scale_parameter(downstream)]
-    small_lora_params = ([p for p in small_lora_model.parameters() if p.requires_grad]
-                         if small_lora_model is not None else [])
-    for parameter in small_lora_params:
-        parameter.data = parameter.data.float()
-    use_lora_delay = (bool(small_lora_params) and not args.resume
+    lora_params = {
+        name: [p for p in model.parameters() if p.requires_grad]
+        for name, model in small_lora_models.items()
+    }
+    for params in lora_params.values():
+        for parameter in params:
+            parameter.data = parameter.data.float()
+    all_lora_params = [parameter for params in lora_params.values()
+                       for parameter in params]
+    use_lora_delay = (bool(all_lora_params) and not args.resume
                       and args.small_lora_delay_steps > 0)
     if use_lora_delay:
-        for parameter in small_lora_params:
+        for parameter in all_lora_params:
             parameter.requires_grad_(False)
     groups = []
     if up_bridge:
@@ -335,18 +392,26 @@ def main():
                    "weight_decay": args.weight_decay, "name": "downstream_bridge"})
     groups.append({"params": down_scale, "lr": args.downstream_alpha_lr,
                    "weight_decay": 0.0, "name": "downstream_alpha"})
-    if small_lora_params:
-        groups.append({"params": small_lora_params, "lr": args.small_lora_lr,
-                       "weight_decay": 0.0, "name": "small_lora"})
+    for name in ("upstream", "downstream"):
+        if lora_params.get(name):
+            spec = lora_specs[name]
+            groups.append({"params": lora_params[name], "lr": spec["lr"],
+                           "weight_decay": 0.0,
+                           "name": f"{name}_small_lora"})
     optimizer = torch.optim.AdamW(groups)
 
     n_up = sum(p.numel() for p in up_bridge)
     n_down = sum(p.numel() for p in down_bridge)
-    n_small_lora = sum(p.numel() for p in small_lora_params)
-    small_mode = "基础权重冻结、LoRA 共享训练" if small_lora_params else "完全冻结"
-    print(f"小模型权重: 两条旁路共享，{small_mode}；adapter/alpha 相互独立")
+    n_lora = {name: sum(p.numel() for p in lora_params.get(name, []))
+              for name in ("upstream", "downstream")}
+    n_small_lora = sum(n_lora.values())
+    small_mode = ("两份独立冻结基座，各自训练专属 LoRA"
+                  if all_lora_params else "共享一份完全冻结基座")
+    print(f"小模型权重: {small_mode}；adapter/alpha/LoRA 均不跨旁路共享")
     print(f"可训练参数: upstream={n_up / 1e6:.2f}M | "
-          f"downstream={n_down / 1e6:.2f}M | small_lora={n_small_lora / 1e6:.2f}M "
+          f"downstream={n_down / 1e6:.2f}M | "
+          f"up_lora={n_lora['upstream'] / 1e6:.2f}M | "
+          f"down_lora={n_lora['downstream'] / 1e6:.2f}M "
           f"| total={(n_up + n_down + n_small_lora) / 1e6:.2f}M")
     print("优化器参数组: " + " | ".join(
         f"{g['name']} lr={g['lr']:.2e} wd={g['weight_decay']:g}" for g in groups))
@@ -357,9 +422,11 @@ def main():
     if downstream_warmup:
         print(f"下游旁路 warmup: 前 {args.branch_warmup_steps} step 固定 "
               f"alpha={args.branch_warmup_alpha:g}")
-    if small_lora_params:
-        print(f"共享小模型 LoRA: rank={args.small_lora_r or 'resume'} | "
-              f"lr={args.small_lora_lr:.2e} | delay={args.small_lora_delay_steps}")
+    for name in ("upstream", "downstream"):
+        if name in small_lora_models:
+            spec = lora_specs[name]
+            print(f"{name} 专属 small LoRA: rank={spec['rank'] or 'resume'} | "
+                  f"lr={spec['lr']:.2e} | delay={args.small_lora_delay_steps}")
     print("监督目标: response-only causal CE；四路消融只用于验证，不进入训练 loss")
 
     records = load_records(args.data, 0)
@@ -413,8 +480,8 @@ def main():
         large.eval()
         upstream.eval()
         downstream.eval()
-        if small_lora_model is not None:
-            small_lora_model.eval()
+        for model in small_lora_models.values():
+            model.eval()
         totals = {key: [0.0, 0.0] for key in
                   ("both", "upstream", "downstream", "off")}
         seen = 0
@@ -436,8 +503,8 @@ def main():
         large.train()
         upstream.train(joint)
         downstream.train()
-        if small_lora_model is not None:
-            small_lora_model.train()
+        for model in small_lora_models.values():
+            model.train()
         return {key: value[0] / max(value[1], 1.0)
                 for key, value in totals.items()}
 
@@ -466,25 +533,33 @@ def main():
                 "downstream": BRIDGE_PRESETS[downstream_name],
             },
             "small_lora": {
-                "enabled": small_lora_model is not None,
-                "rank": args.small_lora_r,
-                "alpha": args.small_lora_alpha or (
-                    2 * max(1, args.small_lora_r) if small_lora_model is not None else 0),
-                "suffix": ".small_lora",
+                "mode": "independent" if small_lora_models else "none",
+                "branches": {
+                    name: {
+                        "enabled": name in small_lora_models,
+                        "rank": spec["rank"],
+                        "alpha": spec["alpha"] or (
+                            2 * max(1, spec["rank"])
+                            if name in small_lora_models else 0),
+                        "lr": spec["lr"],
+                        "suffix": spec["suffix"],
+                    }
+                    for name, spec in lora_specs.items()
+                },
             },
         }
         save_multi_fusion(fusions, path, metadata)
-        if small_lora_model is not None:
-            lora_path = path + ".small_lora"
-            small_lora_model.save_pretrained(lora_path)
-            print(f"    共享小模型 LoRA 已保存: {lora_path}")
+        for name, model in small_lora_models.items():
+            lora_path = path + lora_specs[name]["suffix"]
+            model.save_pretrained(lora_path)
+            print(f"    {name} 专属 small LoRA 已保存: {lora_path}")
 
     for epoch in range(args.epochs):
         for ids, mask, labels, weights in train_loader:
             if use_lora_delay and step == args.small_lora_delay_steps:
-                for parameter in small_lora_params:
+                for parameter in all_lora_params:
                     parameter.requires_grad_(True)
-                print(f"    step {step}: 共享小模型 LoRA delay 结束，开始优化")
+                print(f"    step {step}: 两条专属 small LoRA delay 结束，开始优化")
             if downstream_warmup and step == args.branch_warmup_steps:
                 scale_parameter(downstream).requires_grad_(True)
                 print(f"    step {step}: 下游 alpha warmup 结束，开始优化 alpha")
@@ -501,8 +576,11 @@ def main():
             down_grad = grad_norm_and_clip(down_bridge, args.grad_clip)
             up_alpha_grad = grad_norm_and_clip(up_scale, args.alpha_grad_clip)
             down_alpha_grad = grad_norm_and_clip(down_scale, args.alpha_grad_clip)
-            small_lora_grad = grad_norm_and_clip(
-                small_lora_params, args.small_lora_grad_clip)
+            lora_grads = {
+                name: grad_norm_and_clip(
+                    lora_params.get(name, []), lora_specs[name]["grad_clip"])
+                for name in ("upstream", "downstream")
+            }
             optimizer.step()
             for fusion in fusions.values():
                 if (fusion.gate_mode == "rezero" and args.branch_alpha_max > 0
@@ -525,7 +603,8 @@ def main():
                       f"| RMS[up={ratios[0]:.4f},down={ratios[1]:.4f}] "
                       f"| grad[up={up_grad:.2e},down={down_grad:.2e},"
                       f"up_a={up_alpha_grad:.2e},down_a={down_alpha_grad:.2e}] "
-                      f"| small_lora_grad={small_lora_grad:.2e} "
+                      f"| lora_grad[up={lora_grads['upstream']:.2e},"
+                      f"down={lora_grads['downstream']:.2e}] "
                       f"| lr[{lrs}] | {time.time() - started:.0f}s")
 
             if eval_loader is not None and step % args.eval_every == 0:
