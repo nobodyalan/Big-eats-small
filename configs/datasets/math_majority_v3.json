@@ -8,5 +8,10 @@
   "recipe": "metamath_math_majority_v3_group_disjoint",
   "split_policy": "all variants of one normalized original_question stay in one split; final eval_samples records are validation",
   "external_test_policy": "normalized original questions from MATH test, GSM8K test, and Omni-MATH rule test are blocked from both train and validation",
-  "notes": "Run scripts/prepare_data.py --skip_zh --skip_mix first so converted MetaMathQA rows contain original_question metadata."
+  "target_mix": "about 75% MATH (official train plus 18000 MetaMath-MATH) and 25% MetaMath-GSM8K (8000), matching v2 source counts",
+  "max_variants_per_original_group": 10,
+  "expected_train_records": 31994,
+  "expected_validation_records": 1998,
+  "expected_total_records": 33992,
+  "notes": "Run scripts/prepare_data.py --skip_zh --skip_mix first so converted MetaMathQA rows contain original_question metadata. All variants from one original remain in one split; the cap controls representation count, not split isolation."
 }

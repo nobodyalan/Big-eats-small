@@ -249,7 +249,11 @@ def main():
     parser.add_argument("--meta_math_train", type=int, default=18000)
     parser.add_argument("--meta_gsm_train", type=int, default=8000)
     parser.add_argument("--meta_gsm_val", type=int, default=500)
-    parser.add_argument("--max_variants_per_group", type=int, default=3)
+    # MetaMathQA 的 MATH 部分由较少原题产生大量推理/改写变体。服务器实测在
+    # 完整 test/val 原题封锁后，cap=3/cap=6 分别只能提供 10,529/15,291 条，
+    # 均无法满足保持 v2 配方所需的 18,000 条 MetaMath-MATH。cap=10 给容量留出
+    # 余量，同时仍显式限制单题权重并维持原题组级 split 隔离。
+    parser.add_argument("--max_variants_per_group", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     # v3 使用新文件名，绝不静默覆盖历史实验依赖的 v2 数据。
     parser.add_argument("--out_train", default="data/math_majority_v3_train.jsonl")

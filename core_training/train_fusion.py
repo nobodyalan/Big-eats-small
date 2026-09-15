@@ -220,7 +220,7 @@ def diagnose_train_branch(branch_ratio, branch_scale, bridge_grad,
                           alpha_grad=0.0, lora_grad=0.0,
                           alpha_trainable=True, lora_trainable=False,
                           min_ratio=1e-4, max_ratio=0.5,
-                          grad_epsilon=1e-10):
+                          grad_epsilon=1e-10, alpha_max=0.0):
     """返回分支数值/梯度健康告警，不改变训练过程。
 
     这里只能判断旁路是否“活着”；是否携带样本相关的有效信息，必须由验证集上的
@@ -249,6 +249,9 @@ def diagnose_train_branch(branch_ratio, branch_scale, bridge_grad,
     if alpha_trainable:
         if abs(values["branch_scale"]) < min_ratio:
             warnings.append("alpha 接近零，疑似关闭旁路")
+        if alpha_max > 0 and abs(values["branch_scale"]) >= 0.98 * alpha_max:
+            warnings.append(
+                f"alpha 接近硬上限({values['branch_scale']:.4g} / ±{alpha_max:.4g})")
         if values["alpha_grad"] <= grad_epsilon:
             warnings.append("alpha 梯度近零")
     if lora_trainable and values["lora_grad"] <= grad_epsilon:
@@ -464,6 +467,10 @@ def main():
                         help="4B 取隐状态层(含, 0-based); None=自动 1/3 位置")
     parser.add_argument("--large_end", type=int, default=None,
                         help="4B 加回残差层(含, 0-based); None=自动 2/3 位置")
+    parser.add_argument("--injection_mode", choices=("span", "pre_block"),
+                        default="span",
+                        help=("span=跨层取出/加回；pre_block=在 large_start 层的 "
+                              "attention 前经过小模型并立即加回"))
     parser.add_argument("--bypass_small", action="store_true",
                         help="跳过冻结小模型层，仅训练同容量 bridge（必要 control）")
     parser.add_argument("--small_lora_r", type=int, default=0,
@@ -489,8 +496,8 @@ def main():
     parser.add_argument("--seed", type=int, default=None,
                         help="训练随机种子；None 使用 Config.seed")
     parser.add_argument("--eval_every", type=int, default=200, help="每隔 N 步对比一次 baseline/fusion loss")
-    parser.add_argument("--eval_samples", type=int, default=1999,
-                        help="从文件末尾留出的验证条数；v3 默认 1999")
+    parser.add_argument("--eval_samples", type=int, default=1998,
+                        help="从文件末尾留出的验证条数；当前 v3 清单为 1998")
     parser.add_argument("--eval_batch_size", type=int, default=8, help="评估时的 batch(越大评估越快)")
     parser.add_argument("--eval_max_samples", type=int, default=400,
                         help="每次评估最多用多少条(0=全部; 验证集大时应设小, 否则每步评估很慢)")
@@ -518,6 +525,11 @@ def main():
     args = parser.parse_args()
     if args.branch_warmup_steps < 0:
         parser.error("--branch_warmup_steps 必须 >= 0")
+    if args.branch_alpha_max < 0:
+        parser.error("--branch_alpha_max 必须 >= 0")
+    if (args.branch_alpha_max > 0
+            and abs(args.branch_warmup_alpha) > args.branch_alpha_max):
+        parser.error("--branch_warmup_alpha 不能超过 --branch_alpha_max")
     if args.small_lora_delay_steps < 0:
         parser.error("--small_lora_delay_steps 必须 >= 0")
     if args.guide_every < 1:
@@ -543,6 +555,7 @@ def main():
         cfg.fusion_large_start = args.large_start
     if args.large_end is not None:
         cfg.fusion_large_end = args.large_end
+    cfg.fusion_injection_mode = args.injection_mode
     cfg.fusion_bridge_depth = args.bridge_depth
     if args.bridge_mlp_dim is not None:
         cfg.fusion_mlp_dim = args.bridge_mlp_dim
@@ -577,7 +590,10 @@ def main():
     out_path = args.out or f"cache/fusion_L{l1}-{l2}_s{s1}_{s2}_{ts}.pt"
     plot_path = args.plot if args.plot is not None else f"cache/train_fusion_L{l1}-{l2}_s{s1}_{s2}_{ts}.png"
     segment_desc = "bridge-only control" if args.bypass_small else f"0.6B 第{s1}~{s2}层"
-    print(f"接入位置: 4B 第{l1}层取 → 第{l2}层加回 | {segment_desc}")
+    if args.injection_mode == "pre_block":
+        print(f"接入位置: 4B 第{l1}层 attention 前单点回路 | {segment_desc}")
+    else:
+        print(f"接入位置: 4B 第{l1}层取 → 第{l2}层加回 | {segment_desc}")
     print(f"输出权重: {out_path} | loss 图: {plot_path}")
     # 梯度检查点需要模型处于 train 模式才生效;Qwen3 attention_dropout=0 无噪声
     large.train()
@@ -604,6 +620,9 @@ def main():
             small, s1, s2, max(1, args.small_lora_r), alpha,
             args.small_lora_dropout, targets, resume_path)
         small_lora_model.train()
+        # LoRA 挂在 fusion 引用的小模型层中，而不属于 fusion.parameters()。
+        # 告知 hook 不可把冻结 adapter 的旁路误判为完全冻结并套 no_grad。
+        fusion.external_trainable = True
     # 关键修复: 适配器参数用 fp32 主权重。attach_fusion 把它们搬到 bf16, 若直接
     # 让 AdamW 更新 bf16 参数, 梯度小到 bf16 精度(约 3 位有效数字)就归零,
     # 训练几十步后彻底冻结。这里转回 fp32, 前向用 autocast 做 bf16 计算。
@@ -869,7 +888,8 @@ def main():
             alpha_grad = torch.nn.utils.clip_grad_norm_(
                 scale_params, args.alpha_grad_clip, error_if_nonfinite=True)
             opt.step()
-            if fusion.gate_mode == "rezero" and args.branch_alpha_max > 0:
+            if (fusion.gate_mode == "rezero" and args.branch_alpha_max > 0
+                    and fusion.branch_alpha.requires_grad):
                 with torch.no_grad():
                     fusion.branch_alpha.clamp_(
                         -args.branch_alpha_max, args.branch_alpha_max)
@@ -895,7 +915,8 @@ def main():
                     alpha_trainable=scale_param.requires_grad,
                     lora_trainable=any(p.requires_grad for p in small_lora_params),
                     min_ratio=args.branch_min_rms_ratio,
-                    max_ratio=args.branch_max_rms_ratio)
+                    max_ratio=args.branch_max_rms_ratio,
+                    alpha_max=args.branch_alpha_max)
                 health_text = "OK" if not health else "WARN: " + "; ".join(health)
                 print(f"epoch {ep + 1} step {step:>6} | CE {ce.item():.4f}{extra} "
                       f"| branch_scale {gate:.5f} | branch/base RMS {branch_ratio:.4f} "

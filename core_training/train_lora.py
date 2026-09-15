@@ -61,7 +61,7 @@ def main():
     parser.add_argument("--answer_weight", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval_every", type=int, default=200)
-    parser.add_argument("--eval_samples", type=int, default=1999)
+    parser.add_argument("--eval_samples", type=int, default=1998)
     parser.add_argument("--eval_batch_size", type=int, default=8)
     parser.add_argument("--eval_max_samples", type=int, default=400)
     parser.add_argument("--log_every", type=int, default=10)

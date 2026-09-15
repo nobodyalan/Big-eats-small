@@ -41,7 +41,7 @@
     "guide_weight": 0,
     "contrast_weight": 0,
     "answer_weight": 2.0,
-    "eval_samples": 1999,
+    "eval_samples": 1998,
     "eval_batch_size": 8,
     "eval_every": 500,
     "eval_max_samples": 400,

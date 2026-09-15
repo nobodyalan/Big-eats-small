@@ -329,6 +329,8 @@ def attach_multi_fusion_checkpoint(model_large, model_small, payload):
         branch_cfg = Config()
         branch_cfg.fusion_large_start = int(saved_meta["large_l1"])
         branch_cfg.fusion_large_end = int(saved_meta["large_l2"])
+        branch_cfg.fusion_injection_mode = str(
+            saved_meta.get("injection_mode", "span"))
         branch_cfg.fusion_small_start = int(saved_meta["small_s1"])
         branch_cfg.fusion_small_end = int(saved_meta["small_s2"])
         branch_cfg.fusion_mlp_dim = int(saved_meta["mlp_dim"])
@@ -336,7 +338,9 @@ def attach_multi_fusion_checkpoint(model_large, model_small, payload):
         branch_cfg.fusion_bypass_small = bool(saved_meta.get("bypass_small", False))
         fusion_map[fusion_name] = attach_fusion(
             model_large, model_small, branch_cfg, name=fusion_name)
-    if fusion_map["upstream"].l2 >= fusion_map["downstream"].l1:
+    if (fusion_map["upstream"].injection_mode == "span"
+            and fusion_map["downstream"].injection_mode == "span"
+            and fusion_map["upstream"].l2 >= fusion_map["downstream"].l1):
         raise ValueError("双 Bridge checkpoint 的上游注入点必须早于下游捕获点")
     meta = load_multi_fusion(fusion_map, payload)
     return fusion_map, meta
@@ -538,6 +542,9 @@ def main():
                         help="4B 取隐状态层(含, 0-based); None=自动 1/3 位置")
     parser.add_argument("--large_end", type=int, default=None,
                         help="4B 加回残差层(含, 0-based); None=自动 2/3 位置")
+    parser.add_argument("--injection_mode", choices=("span", "pre_block"),
+                        default="span",
+                        help="单 Bridge 注入模式；必须与 checkpoint 一致")
     parser.add_argument("--bypass_small", action="store_true",
                         help="评测 bridge-only control checkpoint")
     parser.add_argument("--fusion_device", default="", help="旁路模型设备(空=自动 cuda:0)")
@@ -599,8 +606,6 @@ def main():
         parser.error("--fusion_only 与 --baseline_only 不能同时使用")
     if args.ckpt and args.multi_fusion_ckpt:
         parser.error("--ckpt 与 --multi_fusion_ckpt 只能选择一个")
-    if args.multi_fusion_ckpt and args.small_lora_ckpt:
-        parser.error("当前多 Bridge 训练不含 small LoRA，不能传 --small_lora_ckpt")
     if args.multi_fusion_ckpt and any(value is not None for value in (
             args.small_start, args.small_end, args.large_start, args.large_end)):
         parser.error("多 Bridge 的层位置来自 checkpoint，不要再传单 Bridge 层号")
@@ -706,6 +711,7 @@ def main():
         cfg.fusion_large_start = args.large_start
     if args.large_end is not None:
         cfg.fusion_large_end = args.large_end
+    cfg.fusion_injection_mode = args.injection_mode
     cfg.fusion_bypass_small = args.bypass_small
     dt = resolve_dtype(cfg.dtype)
     large_path = resolve_model_path(cfg.model_large_id, cfg.model_large_local)
@@ -722,6 +728,7 @@ def main():
     fusions = []
     multi_payload = None
     multi_meta = None
+    small_lora_model = None
 
     def _resolve_dev(pref: str, fallback: str) -> str:
         d = pref or fallback
@@ -754,6 +761,23 @@ def main():
                 for name in required_names)
             print(f"双 Bridge scales: {scales} | meta={multi_meta} (设备 {fdev})")
             del multi_payload
+            lora_meta = multi_meta.get("small_lora", {}) if isinstance(multi_meta, dict) else {}
+            paired_lora = args.small_lora_ckpt
+            if not paired_lora and lora_meta.get("enabled"):
+                paired_lora = args.multi_fusion_ckpt + str(
+                    lora_meta.get("suffix", ".small_lora"))
+            if paired_lora:
+                if not os.path.isdir(paired_lora):
+                    raise SystemExit(
+                        "[错误] 双 Bridge checkpoint 声明使用共享 small LoRA，但配套目录不存在: "
+                        f"{paired_lora}")
+                from peft import PeftModel
+                # 两条 fusion 保存的 layer 引用指向同一个 small base；PEFT 原地
+                # 替换并集层的线性模块，因此两条旁路会共同使用所加载的 LoRA。
+                small_lora_model = PeftModel.from_pretrained(
+                    small, paired_lora, is_trainable=False).eval()
+                args.small_lora_ckpt = paired_lora
+                print(f"已加载多 Bridge 共享 small LoRA: {paired_lora}")
         else:
             fusion = attach_fusion(large_f, small, cfg)
             fusions = [fusion]

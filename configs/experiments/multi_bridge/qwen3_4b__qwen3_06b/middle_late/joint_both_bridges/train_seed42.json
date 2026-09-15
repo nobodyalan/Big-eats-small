@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "experiment_key": "multi_bridge/qwen3_4b__qwen3_06b/middle_late/joint_both_bridges/seed42",
+  "direction": "multi_bridge",
+  "model_group": "qwen3_4b__qwen3_06b",
+  "variant": "middle_late_joint_both_bridges",
+  "name": "train_middle_late_joint_both_bridges_seed42",
+  "description": "Load trained middle and late bridges, unfreeze both adapters and both independent alphas, keep the shared small model frozen",
+  "program": "core_training/train_multi_fusion.py",
+  "gpu": 2,
+  "env": {"PYTHONUNBUFFERED": "1"},
+  "args": {
+    "pair": "middle-late",
+    "strategy": "joint",
+    "upstream_ckpt": {"first_existing": [
+      "models/trained/single_bridge/qwen3_4b__qwen3_06b/middle_l12-24_s9-19/seed42/adapter.pt.best_useful",
+      "models/trained/single_bridge/qwen3_4b__qwen3_06b/middle_l12-24_s9-19/seed42/adapter.pt.best",
+      "models/trained/single_bridge/qwen3_4b__qwen3_06b/middle_l12-24_s9-19/seed42/adapter.pt"
+    ]},
+    "downstream_ckpt": {"first_existing": [
+      "models/trained/single_bridge/qwen3_4b__qwen3_06b/late_l25-31_s18-27/seed42/adapter.pt.best_useful",
+      "models/trained/single_bridge/qwen3_4b__qwen3_06b/late_l25-31_s18-27/seed42/adapter.pt.best",
+      "models/trained/single_bridge/qwen3_4b__qwen3_06b/late_l25-31_s18-27/seed42/adapter.pt"
+    ]},
+    "data": "data/math_majority_v3_all.jsonl",
+    "max_samples": 0,
+    "epochs": 1,
+    "batch_size": 8,
+    "max_len": 1536,
+    "bridge_depth": 1,
+    "bridge_mlp_dim": 4096,
+    "upstream_lr": 0.00001,
+    "downstream_lr": 0.00001,
+    "upstream_alpha_lr": 0.00005,
+    "downstream_alpha_lr": 0.00005,
+    "small_lora_r": 0,
+    "weight_decay": 0.01,
+    "warmup_steps": 200,
+    "branch_warmup_steps": 0,
+    "branch_alpha_max": 0.25,
+    "grad_clip": 1.0,
+    "alpha_grad_clip": 0.1,
+    "grad_checkpoint": 1,
+    "attn_impl": "flash_attention_2",
+    "answer_weight": 2.0,
+    "eval_samples": 1998,
+    "eval_batch_size": 8,
+    "eval_every": 500,
+    "eval_max_samples": 400,
+    "log_every": 10,
+    "patience": 0,
+    "save_each_epoch": 1,
+    "seed": 42,
+    "out": "models/trained/multi_bridge/qwen3_4b__qwen3_06b/middle_late/joint_both_bridges/seed42/bridges.pt",
+    "plot": "logs/multi_bridge/qwen3_4b__qwen3_06b/middle_late/joint_both_bridges/seed42/train_loss.png"
+  },
+  "required_paths": ["data/math_majority_v3_all.jsonl", "data/math_majority_v3_manifest.json"],
+  "required_any_paths": [
+    [
+      "models/trained/single_bridge/qwen3_4b__qwen3_06b/middle_l12-24_s9-19/seed42/adapter.pt.best_useful",
+      "models/trained/single_bridge/qwen3_4b__qwen3_06b/middle_l12-24_s9-19/seed42/adapter.pt.best",
+      "models/trained/single_bridge/qwen3_4b__qwen3_06b/middle_l12-24_s9-19/seed42/adapter.pt"
+    ],
+    [
+      "models/trained/single_bridge/qwen3_4b__qwen3_06b/late_l25-31_s18-27/seed42/adapter.pt.best_useful",
+      "models/trained/single_bridge/qwen3_4b__qwen3_06b/late_l25-31_s18-27/seed42/adapter.pt.best",
+      "models/trained/single_bridge/qwen3_4b__qwen3_06b/late_l25-31_s18-27/seed42/adapter.pt"
+    ]
+  ],
+  "log_path": "logs/multi_bridge/qwen3_4b__qwen3_06b/middle_late/joint_both_bridges/seed42/train.log",
+  "resolved_config_path": "models/trained/multi_bridge/qwen3_4b__qwen3_06b/middle_late/joint_both_bridges/seed42/resolved_config.json"
+}

@@ -42,6 +42,19 @@ def tiny_fusion(large_end=2):
     return small, large, fusion
 
 
+def tiny_preblock_fusion(layer=2):
+    small, large = tiny_qwen(), tiny_qwen()
+    cfg = Config()
+    cfg.fusion_injection_mode = "pre_block"
+    cfg.fusion_large_start = layer
+    cfg.fusion_small_start = 1
+    cfg.fusion_small_end = 3
+    cfg.fusion_mlp_dim = 32
+    fusion = attach_fusion(large, small, cfg)
+    fusion.eval()
+    return small, large, fusion
+
+
 def randomize_up_projections(fusion):
     with torch.no_grad():
         for module in fusion.modules():
@@ -51,6 +64,57 @@ def randomize_up_projections(fusion):
 
 
 class FusionRuntimeTests(unittest.TestCase):
+    def test_external_trainable_branch_keeps_autograd_when_adapter_is_frozen(self):
+        _, large, fusion = tiny_preblock_fusion(layer=2)
+        randomize_up_projections(fusion)
+        with torch.no_grad():
+            fusion.branch_alpha.fill_(0.25)
+        for parameter in fusion.parameters():
+            parameter.requires_grad_(False)
+        ids = torch.randint(0, 64, (1, 6))
+
+        def input_gradient(external_trainable):
+            fusion.external_trainable = external_trainable
+            embeddings = large.model.embed_tokens(ids).detach().requires_grad_(True)
+            output = large.model(inputs_embeds=embeddings, use_cache=False)
+            return torch.autograd.grad(output.last_hidden_state.sum(), embeddings)[0]
+
+        frozen_gradient = input_gradient(False)
+        external_gradient = input_gradient(True)
+        self.assertFalse(torch.equal(frozen_gradient, external_gradient))
+
+    def test_preblock_injects_before_attention_and_alpha_zero_is_identity(self):
+        _, large, fusion = tiny_preblock_fusion(layer=2)
+        randomize_up_projections(fusion)
+        ids = torch.randint(0, 64, (1, 6))
+        observed = []
+
+        def observe_input(module, args, kwargs):
+            observed.append((args[0] if args else kwargs["hidden_states"]).detach().clone())
+
+        handle = large.model.layers[2].register_forward_pre_hook(
+            observe_input, with_kwargs=True)
+        try:
+            with torch.no_grad():
+                fusion.enabled = False
+                off = large.model(input_ids=ids, use_cache=False).last_hidden_state
+                input_off = observed[-1]
+                fusion.enabled = True
+                fusion.branch_alpha.zero_()
+                zero = large.model(input_ids=ids, use_cache=False).last_hidden_state
+                input_zero = observed[-1]
+                fusion.branch_alpha.fill_(0.25)
+                on = large.model(input_ids=ids, use_cache=False).last_hidden_state
+                input_on = observed[-1]
+        finally:
+            handle.remove()
+        self.assertTrue(torch.equal(off, zero))
+        self.assertTrue(torch.equal(input_off, input_zero))
+        self.assertFalse(torch.equal(input_off, input_on))
+        self.assertFalse(torch.equal(off, on))
+        self.assertEqual(fusion.l1, fusion.l2)
+        self.assertEqual(fusion.injection_mode, "pre_block")
+
     def test_answer_weighting_uses_last_supported_marker(self):
         text = r"first \\boxed{2}, correction: #### 3. The answer is: 4"
         self.assertEqual(answer_start_char(text), text.index("The answer is:"))

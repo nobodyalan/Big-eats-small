@@ -60,6 +60,9 @@ class Config:
     fusion_pos2_frac: float = 2 / 3   # 4B 加回残差的位置(第 24 层输出)
     fusion_mlp_dim: int = 4096        # 适配器 MLP 中间层维度(可调; 4096 → 约 44M 旁路参数)
     fusion_bridge_depth: int = 1      # 每个 adapter 的深度；2 会增加一个同输出维残差 GLU block
+    # span=从一个大模型层输出取出、在后续层输出加回；pre_block=在同一个
+    # Transformer block 的 attention 之前取残差流、经过小模型后立即加回。
+    fusion_injection_mode: str = "span"
     # 4B 接入位置(取隐状态层/加回残差层, 0-based); None = 自动用 1/3 / 2/3 位置
     fusion_large_start: Optional[int] = None
     fusion_large_end: Optional[int] = None
@@ -409,8 +412,7 @@ class GatedResidualFusion(nn.Module):
         return h
 
     def forward(self, h):
-        """h: (B, L, d_large) 为 4B 在 1/3 处(第 pos1 层输出)的隐状态;
-        返回 (B, L, d_large) 的旁路贡献,由钩子加回 2/3 处残差流"""
+        """把任意接入点的 4B 残差流翻译至小模型再映回，返回已乘 alpha 的贡献。"""
         x = self.input_norm(h)                           # ① 输入归一化 → 单位尺度
         x = self.adapter1(x)
         x = x.to(device=self.small_dev, dtype=self.small_dtype)
@@ -460,6 +462,14 @@ def resolve_small_range(config: Config, n_small: int):
 
 def resolve_large_range(config: Config, n_large: int):
     """解析 4B 接入位置(取隐状态层 l1, 加回残差层 l2; 0-based, 已夹紧, 保证 l2 > l1)。"""
+    mode = getattr(config, "fusion_injection_mode", "span")
+    if mode == "pre_block":
+        layer = config.fusion_large_start if config.fusion_large_start is not None \
+            else int(config.fusion_pos1_frac * n_large)
+        layer = max(0, min(layer, n_large - 1))
+        return layer, layer
+    if mode != "span":
+        raise ValueError(f"未知 fusion injection mode: {mode}")
     l1 = config.fusion_large_start if config.fusion_large_start is not None \
         else int(config.fusion_pos1_frac * n_large)
     l2 = config.fusion_large_end if config.fusion_large_end is not None \
@@ -488,6 +498,7 @@ def attach_fusion(model_large, model_small, config: Config,
     """
     n_large = model_large.config.num_hidden_layers
     n_small = model_small.config.num_hidden_layers
+    injection_mode = getattr(config, "fusion_injection_mode", "span")
     l1, l2 = resolve_large_range(config, n_large)
     s1, s2 = resolve_small_range(config, n_small)
     fusion = GatedResidualFusion(
@@ -518,6 +529,7 @@ def attach_fusion(model_large, model_small, config: Config,
     object.__setattr__(fusion, "s2", s2)
     object.__setattr__(fusion, "l1", l1)
     object.__setattr__(fusion, "l2", l2)
+    object.__setattr__(fusion, "injection_mode", injection_mode)
     object.__setattr__(fusion, "fusion_name", name or f"L{l1}-{l2}_s{s1}-{s2}")
     object.__setattr__(fusion, "bypass_small", bool(config.fusion_bypass_small))
 
@@ -529,11 +541,31 @@ def attach_fusion(model_large, model_small, config: Config,
     object.__setattr__(fusion, "enabled", True)
     object.__setattr__(fusion, "branch_override", None)
     object.__setattr__(fusion, "hook_state", state)
+    # 某些训练会冻结 adapter、只更新其引用的小模型 LoRA。LoRA 参数不属于
+    # fusion.parameters()，因此必须单独标记，避免下面的冻结旁路快路径错误地
+    # 用 no_grad 截断 LoRA 梯度。
+    object.__setattr__(fusion, "external_trainable", False)
 
     def capture(module, args, output):
         # transformers 5.x: 层输出是张量 (B, L, d); 旧版可能是 (hidden_states, ...) 元组
         state["h"] = output[0] if isinstance(output, tuple) else output
         return output
+
+    def branch_for(h_src, base):
+        # 分阶段多 Bridge 训练时，完全冻结的旁路只需要产生固定特征。
+        fusion_trainable = any(p.requires_grad for p in fusion.parameters())
+        external_trainable = bool(getattr(fusion, "external_trainable", False))
+        if torch.is_grad_enabled() and not fusion_trainable and not external_trainable:
+            with torch.no_grad():
+                branch = fusion(h_src)
+        else:
+            branch = fusion(h_src)
+        with torch.no_grad():
+            branch_rms = branch.float().pow(2).mean().sqrt()
+            base_rms = base.float().pow(2).mean().sqrt()
+            state["branch_rms"] = float(branch_rms)
+            state["branch_rms_ratio"] = float(branch_rms / base_rms.clamp_min(1e-8))
+        return branch
 
     def inject(module, args, output):
         if not fusion.enabled:
@@ -541,27 +573,39 @@ def attach_fusion(model_large, model_small, config: Config,
         h_src = state.get("h") if fusion.branch_override is None else fusion.branch_override
         if h_src is None:
             return output
-        # 分阶段多 Bridge 训练时，上游旁路完全冻结。它只需产生固定特征，
-        # 不需要为其内部保存反向激活；下游参数的梯度并不依赖上游对输入的导数。
-        if torch.is_grad_enabled() and not any(
-                p.requires_grad for p in fusion.parameters()):
-            with torch.no_grad():
-                branch = fusion(h_src)
-        else:
-            branch = fusion(h_src)
-        with torch.no_grad():
-            base = output[0] if isinstance(output, tuple) else output
-            branch_rms = branch.float().pow(2).mean().sqrt()
-            base_rms = base.float().pow(2).mean().sqrt()
-            state["branch_rms"] = float(branch_rms)
-            state["branch_rms_ratio"] = float(branch_rms / base_rms.clamp_min(1e-8))
+        base = output[0] if isinstance(output, tuple) else output
+        branch = branch_for(h_src, base)
         if isinstance(output, tuple):
             h = output[0]
             return (h + branch.to(h.dtype),) + output[1:]
         return output + branch.to(output.dtype)
 
-    handles = [model_large.model.layers[l1].register_forward_hook(capture),
-               model_large.model.layers[l2].register_forward_hook(inject)]
+    def inject_pre_block(module, args, kwargs):
+        """在 block 的 attention 之前修改其输入残差流，其他参数保持原样。"""
+        if not fusion.enabled:
+            return None
+        if args:
+            base = args[0]
+        else:
+            base = kwargs.get("hidden_states")
+        if base is None:
+            raise RuntimeError("pre_block hook 未找到 hidden_states")
+        state["h"] = base
+        h_src = base if fusion.branch_override is None else fusion.branch_override
+        branch = branch_for(h_src, base)
+        fused = base + branch.to(base.dtype)
+        if args:
+            return (fused,) + tuple(args[1:]), kwargs
+        updated = dict(kwargs)
+        updated["hidden_states"] = fused
+        return args, updated
+
+    if injection_mode == "pre_block":
+        handles = [model_large.model.layers[l1].register_forward_pre_hook(
+            inject_pre_block, with_kwargs=True)]
+    else:
+        handles = [model_large.model.layers[l1].register_forward_hook(capture),
+                   model_large.model.layers[l2].register_forward_hook(inject)]
     object.__setattr__(fusion, "hook_handles", handles)
     # 多旁路按 attach 顺序注册 hook。early/middle/late 的注入点严格递增时，
     # 下游捕获到的自然是已经包含上游贡献的主模型残差流。保留 _bes_fusion
@@ -573,8 +617,13 @@ def attach_fusion(model_large, model_small, config: Config,
         object.__setattr__(model_large, "_bes_fusion", fusion)
     n_branch = sum(p.numel() for p in fusion.adapter1.parameters()) \
                + sum(p.numel() for p in fusion.adapter2.parameters())
-    print(f"    门控残差旁路已挂载: 4B 第{l1}层输出取隐状态 → 0.6B 第{s1}~{s2}层 "
-          f"→ 4B 第{l2}层加回 | 适配器可训练参数 {n_branch/1e6:.1f}M")
+    if injection_mode == "pre_block":
+        desc = (f"4B 第{l1}层 attention 前残差流 → 0.6B 第{s1}~{s2}层 "
+                f"→ 同一残差流加回后进入该层")
+    else:
+        desc = (f"4B 第{l1}层输出取隐状态 → 0.6B 第{s1}~{s2}层 "
+                f"→ 4B 第{l2}层加回")
+    print(f"    门控残差旁路已挂载: {desc} | 适配器可训练参数 {n_branch/1e6:.1f}M")
     return fusion
 
 
@@ -588,6 +637,7 @@ def fusion_payload(fusion: GatedResidualFusion):
             "small_s2": int(getattr(fusion, "s2", -1)),
             "large_l1": int(getattr(fusion, "l1", -1)),
             "large_l2": int(getattr(fusion, "l2", -1)),
+            "injection_mode": str(getattr(fusion, "injection_mode", "span")),
             "mlp_dim": int(fusion.adapter1.down.out_features),
             "bridge_depth": 1 + len(fusion.adapter1.blocks),
             "d_large": int(fusion.adapter1.down.in_features),
@@ -672,6 +722,11 @@ def _load_fusion_payload(fusion: GatedResidualFusion, obj, source: str):
             if saved_large[0] is not None and saved_large != current_large:
                 raise ValueError(f"检查点大模型接入位置不符: "
                                  f"checkpoint={saved_large}, current={current_large}")
+            saved_mode = meta.get("injection_mode", "span")
+            current_mode = str(getattr(fusion, "injection_mode", "span"))
+            if saved_mode != current_mode:
+                raise ValueError("检查点注入模式与当前架构不符: "
+                                 f"checkpoint={saved_mode}, current={current_mode}")
             saved_bypass = meta.get("bypass_small")
             current_bypass = bool(getattr(fusion, "bypass_small", False))
             if saved_bypass is not None and bool(saved_bypass) != current_bypass:

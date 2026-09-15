@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """两条小模型 Bridge 的分阶段/联合训练。
 
-实验变量只有一个：
+主要训练策略：
   staged: 加载并冻结已经训练好的上游 Bridge，只训练新接入的下游 Bridge；
   joint:  使用完全相同的初始化，同时训练上游和下游 Bridge。
 
-两条旁路共享同一份冻结 0.6B 权重（数学上等价于复制两份相同冻结模型，
-但显存更省），各自拥有独立 adapter、branch alpha、hook 状态和生成 cache。
+两条旁路共享同一份 0.6B 基础权重（显存更省），各自拥有独立 adapter、
+branch alpha、hook 状态和生成 cache。可选 small LoRA 也在实际使用层的并集上
+共享，用于和“仅联合训练两个 Bridge”构成单变量对照。
 """
 
 from __future__ import annotations
@@ -30,8 +31,8 @@ sys.path.insert(0, os.path.join(_ROOT, "eval"))
 from main import (Config, attach_fusion, load_fusion, load_multi_fusion,
                   model_device, resolve_dtype, resolve_model_path,
                   save_multi_fusion)
-from train_fusion import (TextDataset, causal_lm_loss, causal_lm_loss_parts,
-                          collate, load_records)
+from train_fusion import (TextDataset, attach_small_lora, causal_lm_loss,
+                          causal_lm_loss_parts, collate, load_records)
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -177,10 +178,22 @@ def parse_args():
     parser.add_argument("--branch_alpha_max", type=float, default=0.25)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--alpha_grad_clip", type=float, default=0.1)
+    parser.add_argument("--small_lora_r", type=int, default=0,
+                        help="共享小模型在两条旁路层范围并集上的 LoRA rank；0=关闭")
+    parser.add_argument("--small_lora_alpha", type=int, default=0,
+                        help="共享小模型 LoRA alpha；0=自动 2×rank")
+    parser.add_argument("--small_lora_dropout", type=float, default=0.05)
+    parser.add_argument("--small_lora_target",
+                        default="q_proj,k_proj,v_proj,o_proj")
+    parser.add_argument("--small_lora_lr", type=float, default=2e-5)
+    parser.add_argument("--small_lora_grad_clip", type=float, default=0.5)
+    parser.add_argument("--small_lora_delay_steps", type=int, default=0)
+    parser.add_argument("--small_lora_resume", default="",
+                        help="可选：继续训练共享小模型 LoRA 目录")
     parser.add_argument("--grad_checkpoint", type=int, default=1)
     parser.add_argument("--attn_impl", default="flash_attention_2")
     parser.add_argument("--answer_weight", type=float, default=2.0)
-    parser.add_argument("--eval_samples", type=int, default=1999)
+    parser.add_argument("--eval_samples", type=int, default=1998)
     parser.add_argument("--eval_batch_size", type=int, default=4)
     parser.add_argument("--eval_every", type=int, default=500)
     parser.add_argument("--eval_max_samples", type=int, default=400)
@@ -198,9 +211,14 @@ def parse_args():
         if getattr(args, name) <= 0:
             parser.error(f"--{name} 必须 > 0")
     for name in ("warmup_steps", "branch_warmup_steps", "eval_samples",
-                 "eval_max_samples", "patience"):
+                 "eval_max_samples", "patience", "small_lora_delay_steps"):
         if getattr(args, name) < 0:
             parser.error(f"--{name} 必须 >= 0")
+    if args.branch_alpha_max < 0:
+        parser.error("--branch_alpha_max 必须 >= 0")
+    if (args.branch_alpha_max > 0
+            and abs(args.branch_warmup_alpha) > args.branch_alpha_max):
+        parser.error("--branch_warmup_alpha 不能超过 --branch_alpha_max")
     return args
 
 
@@ -265,6 +283,27 @@ def main():
     if args.resume:
         load_multi_fusion(fusions, args.resume)
 
+    # 两条旁路共享同一份 0.6B，因此 LoRA 也显式共享；只覆盖实际会运行到的
+    # small layer 并集。middle+late 的并集为连续 S9~S26。
+    small_lora_model = None
+    if args.small_lora_r > 0 or args.small_lora_resume:
+        targets = [x.strip() for x in args.small_lora_target.split(",") if x.strip()]
+        if not targets:
+            raise ValueError("--small_lora_target 不能为空")
+        alpha = args.small_lora_alpha or 2 * max(1, args.small_lora_r)
+        resume_path = args.small_lora_resume
+        if not resume_path and args.resume and os.path.isdir(args.resume + ".small_lora"):
+            resume_path = args.resume + ".small_lora"
+        union_s1 = min(upstream.s1, downstream.s1)
+        union_s2 = max(upstream.s2, downstream.s2)
+        small_lora_model = attach_small_lora(
+            small, union_s1, union_s2, max(1, args.small_lora_r), alpha,
+            args.small_lora_dropout, targets, resume_path)
+        small_lora_model.train()
+        for fusion in fusions.values():
+            # 共享 LoRA 位于外部 small model 中，不在 fusion.parameters() 里。
+            fusion.external_trainable = True
+
     downstream_warmup = (not args.resume and downstream.gate_mode == "rezero"
                          and args.branch_warmup_steps > 0)
     joint = args.strategy == "joint"
@@ -277,6 +316,15 @@ def main():
     down_bridge = bridge_parameters(downstream)
     up_scale = [scale_parameter(upstream)] if joint else []
     down_scale = [scale_parameter(downstream)]
+    small_lora_params = ([p for p in small_lora_model.parameters() if p.requires_grad]
+                         if small_lora_model is not None else [])
+    for parameter in small_lora_params:
+        parameter.data = parameter.data.float()
+    use_lora_delay = (bool(small_lora_params) and not args.resume
+                      and args.small_lora_delay_steps > 0)
+    if use_lora_delay:
+        for parameter in small_lora_params:
+            parameter.requires_grad_(False)
     groups = []
     if up_bridge:
         groups.append({"params": up_bridge, "lr": args.upstream_lr,
@@ -287,13 +335,19 @@ def main():
                    "weight_decay": args.weight_decay, "name": "downstream_bridge"})
     groups.append({"params": down_scale, "lr": args.downstream_alpha_lr,
                    "weight_decay": 0.0, "name": "downstream_alpha"})
+    if small_lora_params:
+        groups.append({"params": small_lora_params, "lr": args.small_lora_lr,
+                       "weight_decay": 0.0, "name": "small_lora"})
     optimizer = torch.optim.AdamW(groups)
 
     n_up = sum(p.numel() for p in up_bridge)
     n_down = sum(p.numel() for p in down_bridge)
-    print(f"小模型权重: 两条旁路共享且冻结；adapter/alpha 相互独立")
+    n_small_lora = sum(p.numel() for p in small_lora_params)
+    small_mode = "基础权重冻结、LoRA 共享训练" if small_lora_params else "完全冻结"
+    print(f"小模型权重: 两条旁路共享，{small_mode}；adapter/alpha 相互独立")
     print(f"可训练参数: upstream={n_up / 1e6:.2f}M | "
-          f"downstream={n_down / 1e6:.2f}M | total={(n_up + n_down) / 1e6:.2f}M")
+          f"downstream={n_down / 1e6:.2f}M | small_lora={n_small_lora / 1e6:.2f}M "
+          f"| total={(n_up + n_down + n_small_lora) / 1e6:.2f}M")
     print("优化器参数组: " + " | ".join(
         f"{g['name']} lr={g['lr']:.2e} wd={g['weight_decay']:g}" for g in groups))
     if args.strategy == "staged":
@@ -303,6 +357,9 @@ def main():
     if downstream_warmup:
         print(f"下游旁路 warmup: 前 {args.branch_warmup_steps} step 固定 "
               f"alpha={args.branch_warmup_alpha:g}")
+    if small_lora_params:
+        print(f"共享小模型 LoRA: rank={args.small_lora_r or 'resume'} | "
+              f"lr={args.small_lora_lr:.2e} | delay={args.small_lora_delay_steps}")
     print("监督目标: response-only causal CE；四路消融只用于验证，不进入训练 loss")
 
     records = load_records(args.data, 0)
@@ -356,6 +413,8 @@ def main():
         large.eval()
         upstream.eval()
         downstream.eval()
+        if small_lora_model is not None:
+            small_lora_model.eval()
         totals = {key: [0.0, 0.0] for key in
                   ("both", "upstream", "downstream", "off")}
         seen = 0
@@ -377,6 +436,8 @@ def main():
         large.train()
         upstream.train(joint)
         downstream.train()
+        if small_lora_model is not None:
+            small_lora_model.train()
         return {key: value[0] / max(value[1], 1.0)
                 for key, value in totals.items()}
 
@@ -404,11 +465,26 @@ def main():
                 "upstream": BRIDGE_PRESETS[upstream_name],
                 "downstream": BRIDGE_PRESETS[downstream_name],
             },
+            "small_lora": {
+                "enabled": small_lora_model is not None,
+                "rank": args.small_lora_r,
+                "alpha": args.small_lora_alpha or (
+                    2 * max(1, args.small_lora_r) if small_lora_model is not None else 0),
+                "suffix": ".small_lora",
+            },
         }
         save_multi_fusion(fusions, path, metadata)
+        if small_lora_model is not None:
+            lora_path = path + ".small_lora"
+            small_lora_model.save_pretrained(lora_path)
+            print(f"    共享小模型 LoRA 已保存: {lora_path}")
 
     for epoch in range(args.epochs):
         for ids, mask, labels, weights in train_loader:
+            if use_lora_delay and step == args.small_lora_delay_steps:
+                for parameter in small_lora_params:
+                    parameter.requires_grad_(True)
+                print(f"    step {step}: 共享小模型 LoRA delay 结束，开始优化")
             if downstream_warmup and step == args.branch_warmup_steps:
                 scale_parameter(downstream).requires_grad_(True)
                 print(f"    step {step}: 下游 alpha warmup 结束，开始优化 alpha")
@@ -425,6 +501,8 @@ def main():
             down_grad = grad_norm_and_clip(down_bridge, args.grad_clip)
             up_alpha_grad = grad_norm_and_clip(up_scale, args.alpha_grad_clip)
             down_alpha_grad = grad_norm_and_clip(down_scale, args.alpha_grad_clip)
+            small_lora_grad = grad_norm_and_clip(
+                small_lora_params, args.small_lora_grad_clip)
             optimizer.step()
             for fusion in fusions.values():
                 if (fusion.gate_mode == "rezero" and args.branch_alpha_max > 0
@@ -447,6 +525,7 @@ def main():
                       f"| RMS[up={ratios[0]:.4f},down={ratios[1]:.4f}] "
                       f"| grad[up={up_grad:.2e},down={down_grad:.2e},"
                       f"up_a={up_alpha_grad:.2e},down_a={down_alpha_grad:.2e}] "
+                      f"| small_lora_grad={small_lora_grad:.2e} "
                       f"| lr[{lrs}] | {time.time() - started:.0f}s")
 
             if eval_loader is not None and step % args.eval_every == 0:
@@ -467,7 +546,7 @@ def main():
                     checkpoint(args.out + ".best", row)
                 else:
                     patience_count += 1
-                if (downstream_gain > 1e-4
+                if (downstream_gain > 1e-4 and upstream_gain > 1e-4
                         and losses["both"] < best_incremental - 1e-4):
                     best_incremental = losses["both"]
                     best_incremental_step = step
@@ -505,10 +584,10 @@ def main():
     if best_step:
         print(f"最优双路 CE={best:.4f} @ step {best_step} | {args.out}.best")
     if best_incremental_step:
-        print(f"最优且下游有增量价值 @ step {best_incremental_step} | "
+        print(f"最优且两条旁路均有条件增量价值 @ step {best_incremental_step} | "
               f"{args.out}.best_incremental")
     else:
-        print("[警告] 尚未观察到 both 明确优于 up-only；新增下游未证明独立价值")
+        print("[警告] 尚未观察到 both 同时优于两个单旁路；双 Bridge 未证明各自具有条件增量价值")
 
 
 if __name__ == "__main__":

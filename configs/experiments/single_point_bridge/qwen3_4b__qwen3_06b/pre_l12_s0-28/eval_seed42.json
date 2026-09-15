@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "experiment_key": "single_point_bridge/qwen3_4b__qwen3_06b/pre_l12_s0-28/seed42",
+  "direction": "single_point_bridge",
+  "model_group": "qwen3_4b__qwen3_06b",
+  "variant": "pre_l12_s0-28",
+  "name": "eval_preblock_l12_small_full_seed42_four_tier_n400",
+  "program": "eval/run_segments_parallel.py",
+  "gpu": 1,
+  "env": {"PYTHONUNBUFFERED": "1"},
+  "args": {
+    "out_dir": "eval_results/single_point_bridge/qwen3_4b__qwen3_06b/pre_l12_s0-28/seed42",
+    "tag": "pre_l12_s0-28_seed42_n400_omni_l3-8",
+    "include_omni_math": true,
+    "quiet": true
+  },
+  "passthrough": [
+    "--limit", "400", "--seed", "42", "--math_lo", "1-3",
+    "--math_hi", "4-5", "--max_new", "1536",
+    "--omni_path", "data/omni_math_rule_test.jsonl", "--omni_levels", "3-8",
+    "--math_judge", "both", "--save_raw_output",
+    "--attn_impl", "flash_attention_2", "--fusion_only",
+    "--injection_mode", "pre_block", "--large_start", "12",
+    "--small_start", "0", "--small_end", "27",
+    "--bridge_depth", "1", "--bridge_mlp_dim", "4096",
+    "--ckpt", {"first_existing": [
+      "models/trained/single_point_bridge/qwen3_4b__qwen3_06b/pre_l12_s0-28/seed42/adapter.pt.best_useful",
+      "models/trained/single_point_bridge/qwen3_4b__qwen3_06b/pre_l12_s0-28/seed42/adapter.pt.best",
+      "models/trained/single_point_bridge/qwen3_4b__qwen3_06b/pre_l12_s0-28/seed42/adapter.pt"
+    ]}
+  ],
+  "required_paths": ["data/.cache/math/MATH.zip", "data/.cache/gsm8k_test.parquet", "data/omni_math_rule_test.jsonl"],
+  "required_any_paths": [[
+    "models/trained/single_point_bridge/qwen3_4b__qwen3_06b/pre_l12_s0-28/seed42/adapter.pt.best_useful",
+    "models/trained/single_point_bridge/qwen3_4b__qwen3_06b/pre_l12_s0-28/seed42/adapter.pt.best",
+    "models/trained/single_point_bridge/qwen3_4b__qwen3_06b/pre_l12_s0-28/seed42/adapter.pt"
+  ]],
+  "log_path": "logs/single_point_bridge/qwen3_4b__qwen3_06b/pre_l12_s0-28/seed42/eval.log",
+  "resolved_config_path": "eval_results/single_point_bridge/qwen3_4b__qwen3_06b/pre_l12_s0-28/seed42/resolved_config.json"
+}
