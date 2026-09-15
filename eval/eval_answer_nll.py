@@ -107,12 +107,14 @@ def encode_answer_example(tokenizer, prompt: str, response: str,
     ]
     if not selected:
         return None, "no_answer_tokens"
-    # A subword that crosses the answer boundary also contains ``{``/``}`` or
-    # marker text, so it is not a pure answer-content token.  Skipping is more
-    # honest than silently claiming that marker probability is answer NLL.
-    if any(offsets[index][0] < start or offsets[index][1] > end
-           for index in selected):
-        return None, "answer_boundary_merged_token"
+    # Subword tokenization can merge the last answer character with ``}``.
+    # There is then no exact character-only token decomposition.  Include every
+    # token overlapping the answer (the standard span-scoring convention), but
+    # record the approximation instead of silently dropping difficult formats.
+    boundary_merged_tokens = sum(
+        offsets[index][0] < start or offsets[index][1] > end
+        for index in selected
+    )
 
     labels = [-100] * len(input_ids)
     prompt_len = len(prompt_ids)
@@ -128,6 +130,7 @@ def encode_answer_example(tokenizer, prompt: str, response: str,
         "attention_mask": torch.ones((1, len(input_ids)), dtype=torch.long),
         "labels": torch.tensor(labels, dtype=torch.long).unsqueeze(0),
         "answer_tokens": len(selected),
+        "answer_boundary_merged_tokens": boundary_merged_tokens,
         "sequence_tokens": len(input_ids),
     }, None
 
@@ -167,6 +170,12 @@ def summarize(rows, label):
     return {
         "scored_examples": len(valid),
         "answer_tokens": token_count,
+        "boundary_merged_examples": sum(
+            bool(row.get("answer_boundary_merged_tokens")) for row in valid
+        ),
+        "boundary_merged_tokens": sum(
+            int(row.get("answer_boundary_merged_tokens", 0)) for row in valid
+        ),
         "token_weighted_nll": token_nll,
         "question_mean_nll": example_nll,
         "token_weighted_perplexity": math.exp(token_nll) if math.isfinite(token_nll) else None,
@@ -250,6 +259,8 @@ def main():
             skipped[reason] = skipped.get(reason, 0) + 1
         else:
             row["sequence_tokens"] = encoded["sequence_tokens"]
+            row["answer_boundary_merged_tokens"] = encoded[
+                "answer_boundary_merged_tokens"]
             if not args.fusion_only:
                 fusion.enabled = False
                 loss_sum, tokens = score_example(large, encoded, device, dtype)
@@ -283,7 +294,8 @@ def main():
         "max_len": args.max_len,
         "answer_nll_definition": (
             "teacher-forced on official gold rationale; loss only on final "
-            "answer content tokens, excluding marker and EOS"
+            "tokens overlapping final-answer content, excluding EOS; tokenizer "
+            "tokens crossing a marker/brace boundary are included and counted"
         ),
         "question_set_sha256": hashlib.sha256(json.dumps(
             fingerprint, ensure_ascii=False, sort_keys=True,
